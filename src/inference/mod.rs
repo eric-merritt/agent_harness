@@ -104,7 +104,7 @@ impl InferenceEngine {
             let cache_path = model_dir.join("global_table.bin");
             if cache_path.exists() {
                 let data = std::fs::read(&cache_path)?;
-                match GlobalTable::deserialize(&data) {
+                match GlobalTable::deserialize_core_chunks(&data) {
                     Some(gt) => {
                         log::info!("InferenceEngine: global table loaded from cache ({} prefixes, {} total tails)",
                             gt.prefixes.len(), gt.flat_tails.len());
