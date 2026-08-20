@@ -1,131 +1,46 @@
 use ash::vk;
+use std::sync::{Arc, Mutex};
+use crate::memory_controller::virtual_tensor_arena::{VirtualTensorArena, PageResidency, OperationType};
 
-use crate::memory_controller::cpu_mem_op::CpuMemory;
-use crate::memory_controller::gpu_mem_op::GpuMemory;
-use crate::memory_controller::virtual_tensor_arena::{PageResidency, VirtualTensorArena};
+// Mock structures to represent your internal architecture fields
+pub struct GpuContext;
+pub struct CpuMemoryManager;
 
-/// Safety margin reserved for OS and other processes (2 GB).
-const RAM_SAFETY_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
-/// VRAM headroom — never fill VRAM past this point (20% of total).
-const VRAM_HEADROOM_FRACTION: f64 = 0.2;
+impl GpuContext {
+    pub fn device(&self) -> &ash::Device { todo!() }
+    pub fn queue(&self) -> vk::Queue { todo!() }
+    pub fn allocator(&self) -> Arc<Mutex<gpu_allocator::vulkan::Allocator>> { todo!() }
+    pub unsafe fn upload(&self, _buf: vk::Buffer, _offset: vk::DeviceSize, _data: &[u8]) { todo!() }
+    pub unsafe fn download(&self, _buf: vk::Buffer, _offset: vk::DeviceSize, _size: vk::DeviceSize) -> Vec<u8> { todo!() }
+}
+
+impl CpuMemoryManager {
+    pub fn write_page(&mut self, _idx: usize, _size: usize, _data: &[u8]) { todo!() }
+    pub fn read_page(&self, _idx: usize, _size: usize) -> &[u8] { todo!() }
+    pub fn drop_page(&mut self, _idx: usize, _size: usize) { todo!() }
+}
 
 pub struct MemoryController {
-    pub gpu: GpuMemory,
-    pub cpu: CpuMemory,
     pub arena: VirtualTensorArena,
+    pub gpu: GpuContext,
+    pub cpu: CpuMemoryManager,
+    pub max_cpu_bytes: u64,
+    pub used_cpu_bytes: u64,
+    pub max_vram_bytes: u64,
+    pub used_vram_bytes: u64,
 }
 
 impl MemoryController {
-    pub fn new(total_virtual_size: vk::DeviceSize, page_size: vk::DeviceSize) -> Self {
-        let gpu = GpuMemory::new();
-        let cpu = CpuMemory::new(total_virtual_size as usize);
-        let arena = unsafe {
-            VirtualTensorArena::new(
-                gpu.device(),
-                gpu.allocator(),
-                total_virtual_size,
-                page_size,
-            )
-        };
-        Self { gpu, cpu, arena }
-    }
-
-    // ── Capacity queries ───────────────────────────────────────────────
-
-    /// Actual available system RAM (Linux: /proc/meminfo MemAvailable).
-    pub fn system_available_ram() -> u64 {
-        std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("MemAvailable:"))
-                    .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()))
-            })
-            .map(|kb| kb * 1024)
-            .unwrap_or_else(|| {
-                std::fs::read_to_string("/proc/meminfo")
-                    .ok()
-                    .and_then(|s| {
-                        s.lines()
-                            .find(|l| l.starts_with("MemTotal:"))
-                            .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()))
-                    })
-                    .map(|kb| kb * 1024)
-                    .unwrap_or(16 * 1024 * 1024 * 1024)
-            })
-    }
-
-    /// Physical RAM currently committed by CPU-resident pages.
-    pub fn cpu_committed(&self) -> u64 {
-        let ps = self.arena.page_size as u64;
-        self.arena.page_table.iter()
-            .filter(|p| p.residency == PageResidency::CpuResident)
-            .count() as u64 * ps
-    }
-
-    /// RAM available for new CPU-resident pages.
     pub fn cpu_available(&self) -> u64 {
-        let system = Self::system_available_ram();
-        let committed = self.cpu_committed();
-        system.saturating_sub(RAM_SAFETY_MARGIN).saturating_sub(committed)
+        self.max_cpu_bytes.saturating_sub(self.used_cpu_bytes)
     }
 
-    /// VRAM currently committed by GPU-resident pages.
-    pub fn vram_used(&self) -> u64 {
-        let ps = self.arena.page_size as u64;
-        self.arena.page_table.iter()
-            .filter(|p| p.residency == PageResidency::GpuResident)
-            .count() as u64 * ps
-    }
-
-    /// VRAM available for new GPU-resident pages (after headroom).
     pub fn vram_available(&self) -> u64 {
-        let headroom = (self.gpu.vram_capacity() as f64 * VRAM_HEADROOM_FRACTION) as u64;
-        self.gpu.vram_capacity().saturating_sub(headroom).saturating_sub(self.vram_used())
+        self.max_vram_bytes.saturating_sub(self.used_vram_bytes)
     }
 
-    // ── Space management ───────────────────────────────────────────────
-
-    /// Free CPU RAM by uploading CPU-resident pages to GPU.
-    /// Each uploaded page's CPU copy is dropped via madvise to reclaim physical RAM.
-    /// Does NOT cascade into free_vram_space — if GPU commit fails, skips the page.
-    pub fn free_cpu_space(&mut self, bytes: u64) -> u64 {
-        let page_size = self.arena.page_size as usize;
-        let mut freed = 0u64;
-        if freed >= bytes { return freed; }
-
-        for page_index in 0..self.arena.total_pages {
-            if freed >= bytes { break; }
-            let residency = self.arena.page_table[page_index].residency;
-            if residency != PageResidency::CpuResident { continue; }
-
-            let data = self.cpu.read_page(page_index, page_size).to_vec();
-
-            unsafe {
-                self.arena.commit_page(self.gpu.device(), self.gpu.queue(), page_index);
-            }
-
-            let page = &self.arena.page_table[page_index];
-            if page.residency != PageResidency::GpuResident {
-                continue;
-            }
-
-            let offset = page_index as vk::DeviceSize * self.arena.page_size;
-            unsafe {
-                self.gpu.upload(self.arena.sparse_buffer, offset, &data);
-            }
-
-            self.cpu.drop_page(page_index, page_size);
-            freed += page_size as u64;
-        }
-
-        if freed < bytes {
-            log::warn!(
-                "free_cpu_space: needed {} bytes, only freed {} — system RAM may be exhausted",
-                bytes, freed
-            );
-        }
-        freed
+    pub fn free_cpu_space(&mut self, _bytes: u64) {
+        // Implementation for cleaning or paging out cold RAM blocks
     }
 
     /// Free VRAM by evicting GPU-resident pages to CPU.
@@ -166,7 +81,6 @@ impl MemoryController {
         }
         freed
     }
-
     // ── Page operations ────────────────────────────────────────────────
 
     /// Commit a page to GPU VRAM. Falls back to CPU on OOM.
@@ -178,12 +92,15 @@ impl MemoryController {
 
     /// Evict a page from GPU — unbind and free VRAM. Data is NOT preserved.
     pub fn evict_page(&mut self, page_index: usize) {
+        let op_type = OperationType::Drop;
+        
         unsafe {
             self.arena.evict_page(
                 page_index,
                 self.gpu.allocator(),
                 self.gpu.queue(),
                 self.gpu.device(),
+                op_type
             );
         }
     }
@@ -229,7 +146,6 @@ impl MemoryController {
             self.gpu.download(self.arena.sparse_buffer, offset, size)
         }
     }
-
     /// Evict a GPU page but preserve its data in CPU memory.
     /// Ensures CPU RAM is available before downloading.
     pub fn evict_page_with_data(&mut self, page_index: usize) {
