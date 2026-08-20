@@ -1,0 +1,69 @@
+[workspace]
+members = ["."]
+
+[package]
+name = "agent_harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui-core = "0.1.2"
+ratatui = "0.30.2"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+url = "2.5"
+base64 = "0.22"
+sha2 = "0.10"
+anyhow = "1.0"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+dashmap = "6.2.1"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zerocopy = "0.8.55"
+ptr = "0.2.3"
+regex = "1.11"
+shellexpand = "3.1"
+chrono = { version = "0.4.45", features = ["serde", "clock"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+openssl = "0.10.81"
+tui-scrollview = "0.6.7"
+sqlx = { version = "0.8", features = [ "runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "uuid", "chrono" ] }
+ttf-parser = "0.21"
+mat = "0.2.0"
+bytemuck = { version = "1", features = ["derive"] }
+ahash = "0.8"
+bincode = "1"
+log = "0.4"
+env_logger = "0.11"
+wgpu = "22"
+pollster = "0.3"
+memmap2 = "0.9"
+ash = { version = "0.38.0", features = ["linked", "std", "libloading", "loaded", "debug"] }
+gpu-allocator = "0.28.0"
+ndarray = "0.16"
+half = "2"
+smallvec = "1"
+criterion = "0.5"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[lib]
+name = "agent_harness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent_harness"
+path = "src/main.rs"
+
+[env]
+DATABASE_URL="postgres://ermer:ermer@localhost/agent_harness"
+
+
+[[bench]]
+name = "dequant_bench"
+harness = false

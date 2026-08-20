@@ -1,0 +1,15 @@
+pub mod memory_controller;
+pub mod types;
+pub mod ui_ux;
+pub mod augment;
+pub mod tools;
+pub mod mcp;
+pub mod gan_loop;
+pub mod autoresearch;
+pub mod smith;
+pub mod database;
+pub mod messaging;
+pub mod models;
+pub mod gpu;
+pub mod inference;
+pub mod progress;
