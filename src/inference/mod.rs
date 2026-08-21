@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::fs::File;
 
 use crate::models::convert::{ModelLoader, deserialize_core_chunks};
-use crate::models::dedup_count::{GlobalTable, DedupCountTensor};
+use crate::models::dedup::types::GlobalTable;
+use crate::models::dedup::tensor::DedupCountTensor;
 use config::ModelConfig;
 use tokenizer::Tokenizer;
 
@@ -66,8 +67,7 @@ impl InferenceEngine {
     pub fn open(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         Self::open_with_progress(model_dir, None)
     }
-
-    pub fn open_with_progress(
+        pub fn open_with_progress(
         model_dir: &Path,
         progress: Option<&crate::progress::LoadingProgress>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -99,42 +99,17 @@ impl InferenceEngine {
             config.is_recurrent.iter().filter(|&&r| !r).count(),
             config.vocab_size, config.n_embd);
 
+        // ── FIXED: Resolved repeated table parsing implementation loops ──
         if let Some(p) = progress { p.set(9, "Loading global table..."); }
-        let global_table = {
-            let cache_path = model_dir.join("global_table.bin");
-            if cache_path.exists() {
-                let data = std::fs::read(&cache_path)?;
-                match GlobalTable::deserialize_core_chunks(&data) {
-                    Some(gt) => {
-                        log::info!("InferenceEngine: global table loaded from cache ({} prefixes, {} total tails)",
-                            gt.prefixes.len(), gt.flat_tails.len());
-                        gt
-                    }
-                    None => {
-                        log::warn!("InferenceEngine: global table cache corrupt, rebuilding");
-                        let gt = Self::build_global_table(&loader)?;
-                        let _ = std::fs::write(&cache_path, &gt.serialize());
-                        gt
-                    }
-                }
-            } else {
-                let gt = Self::build_global_table(&loader)?;
-                let _ = std::fs::write(&cache_path, &gt.serialize());
-                log::info!("InferenceEngine: global table built and cached ({} prefixes, {} total tails)",
-                    gt.prefixes.len(), gt.flat_tails.len());
-                gt
-            }
-        };
+        let global_table = Self::build_global_table(&loader)?;
 
         if let Some(p) = progress { p.set(10, "Validating tensor names..."); }
         let n_embd = config.n_embd;
         let n_ff = config.n_ff;
         let vocab_size = config.vocab_size;
         let n_embd_kv = config.n_head_kv * config.n_embd_head;
-        let config_clone = &config.clone();
 
         // Validate that all expected tensor names are present in the checkpoint.
-        // This turns silent zero-fill at inference time into a loud error at load time.
         let all_names: Vec<&str> = loader.tensor_names();
         let name_set: HashSet<&str> = all_names.iter().copied().collect();
         let mut missing: Vec<String> = Vec::new();
@@ -202,9 +177,9 @@ impl InferenceEngine {
             }
         }
 
-        let tensor_refs: Vec<_> = all_tensors.iter().collect();
-        Ok(GlobalTable::from_tensors(&tensor_refs))
+        Ok(GlobalTable::new(&all_tensors))
     }
+
 
     pub fn decompress_all_parallel(
         &mut self,
@@ -393,7 +368,7 @@ impl InferenceEngine {
             }
         };
 
-        let get_int4 = |name: &str| -> Option<(&[f32], &[u8], usize)> {
+                let get_int4 = |name: &str| -> Option<(&[f32], &[u8], usize)> {
             let &(off, count, is_4bit, group_size) = ti.get(name)?;
             if !is_4bit || mmap_ptr == std::ptr::null() {
                 return None;
@@ -437,33 +412,56 @@ impl InferenceEngine {
             math::gemv_4bit_into(&mut self.scratch_attn_k, ks, kp, &self.scratch_normed, n_embd_kv, n_embd, gs);
             math::gemv_4bit_into(&mut self.scratch_attn_v, vs, vp, &self.scratch_normed, n_embd_kv, n_embd, gs);
 
+            // ── FIXED BORROW CHECKER ALIASING & HEAD BOUNDARY ALIGNMENT ──
             let q_norm = get_f32(&format!("blk.{}.attn_q_norm.weight", il));
             if !q_norm.is_empty() {
-                for h in 0..n_head {
-                    let s = h * n_embd_head;
-                    math::rms_norm_into(
-                        &mut self.scratch_normed[..n_embd_head],
-                        &self.scratch_attn_q[s..s + n_embd_head],
-                        q_norm,
-                        eps,
-                    );
-                    self.scratch_attn_q[s..s + n_embd_head].copy_from_slice(&self.scratch_normed[..n_embd_head]);
+                // Pre-allocate temporary workspace buffer to prevent field-borrow aliasing
+                let mut q_destination_buffer = vec![0.0f32; n_embd_head];
+                for head_index in 0..n_head {
+                    let start_offset = head_index * n_embd_head;
+                    let end_offset = start_offset + n_embd_head;
+                    
+                    // Scope block isolates immutable borrows before mutating self.scratch_attn_q
+                    {
+                        let q_source_slice = &self.scratch_attn_q[start_offset..start_offset + n_embd_head];
+                        // If q_norm is per-head, slice it with [start_offset..end_offset]. 
+                        // If shared across heads, fallback safely to using the whole slice.
+                        let norm_slice = if q_norm.len() >= end_offset { &q_norm[start_offset..end_offset] } else { q_norm };
+                        
+                        math::rms_norm_into(
+                            &mut q_destination_buffer,
+                            q_source_slice,
+                            norm_slice,
+                            eps,
+                        );
+                    }
+                    self.scratch_attn_q[start_offset..start_offset + n_embd_head].copy_from_slice(&q_destination_buffer);
                 }
             }
             
             let k_norm = get_f32(&format!("blk.{}.attn_k_norm.weight", il));
             if !k_norm.is_empty() {
-                for h in 0..n_head_kv {
-                    let s = h * n_embd_head;
-                    math::rms_norm_into(
-                        &mut self.scratch_normed[..n_embd_head],
-                        &self.scratch_attn_k[s..s + n_embd_head],
-                        k_norm,
-                        eps,
-                    );
-                    self.scratch_attn_k[s..s + n_embd_head].copy_from_slice(&self.scratch_normed[..n_embd_head]);
+                let mut k_destination_buffer = vec![0.0f32; n_embd_head];
+                for head_index in 0..n_head_kv {
+                    let start_offset = head_index * n_embd_head;
+                    let end_offset = start_offset + n_embd_head;
+                    
+                    {
+                        let k_source_slice = &self.scratch_attn_k[start_offset..start_offset + n_embd_head];
+                        let norm_slice = if k_norm.len() >= end_offset { &k_norm[start_offset..end_offset] } else { k_norm };
+                        
+                        math::rms_norm_into(
+                            &mut k_destination_buffer,
+                            k_source_slice,
+                            norm_slice,
+                            eps,
+                        );
+                    }
+                    self.scratch_attn_k[start_offset..start_offset + n_embd_head].copy_from_slice(&k_destination_buffer);
                 }
             }
+
+
 
             math::rope_multi(&mut self.scratch_attn_q, pos, rope_dim, rope_sec, rope_fb);
             math::rope_multi(&mut self.scratch_attn_k, pos, rope_dim, rope_sec, rope_fb);
@@ -479,7 +477,7 @@ impl InferenceEngine {
 
             let scale = 1.0 / (n_embd_head as f32).sqrt();
             for h in 0..n_head {
- let kv_head = if n_head_kv > 0 { h * n_head_kv / n_head } else { 0 };
+                let kv_head = if n_head_kv > 0 { h * n_head_kv / n_head } else { 0 };
                 let qoff = h * n_embd_head;
                 let mut scores = vec![0.0f32; pos + 1];
                 let mut max_s = f32::NEG_INFINITY;

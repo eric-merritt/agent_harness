@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::common::{ConversionStats, TensorStats};
 use super::core::deserialize_core_at;
-use super::dedup_count::Sandbag;
+use crate::models::dedup::types::Sandbag;
 
 pub struct ModelLoader {
     pub manifest: ConversionStats,
@@ -82,11 +82,11 @@ impl ModelLoader {
         self.decompress_tensor_impl(name, None, true)
     }
 
-    pub fn decompress_tensor_global(&mut self, name: &str, global: Arc<super::dedup_count::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    pub fn decompress_tensor_global(&mut self, name: &str, global: Arc<crate::models::dedup::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.decompress_tensor_impl(name, Some(global), true)
     }
 
-    pub fn decompress_tensor_global_single(&mut self, name: &str, global: Arc<super::dedup_count::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    pub fn decompress_tensor_global_single(&mut self, name: &str, global: Arc<crate::models::dedup::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.decompress_tensor_impl(name, Some(global), false)
     }
 
@@ -111,12 +111,12 @@ struct ChunkInfo {
     core_pos: usize,
     sand_pos: usize,
     element_count: usize,
-    remap: Option<super::dedup_count::ChunkRemap>,
+    remap: Option<crate::models::dedup::types::ChunkRemap>,
 }
 
 impl ModelLoader {
     fn decompress_tensor_impl(
-        &mut self, name: &str, global: Option<Arc<super::dedup_count::GlobalTable>>, parallel_chunks: bool,
+        &mut self, name: &str, global: Option<Arc<crate::models::dedup::types::GlobalTable>>, parallel_chunks: bool,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let idx = *self.tensor_index.get(name)
             .ok_or_else(|| format!("tensor not found: {}", name))?;
@@ -205,7 +205,7 @@ impl ModelLoader {
                         let chunk_sand = match Sandbag::from_bytes(&sand[ci.sand_pos..]) { Some(s) => s, None => continue };
 
                         let decompressed = if let Some(ref gt) = gt_cloned {
-                            if let Some(ref remap) = ci.remap { gt.decompress_with_remap(&chunk_sand, &tensor, remap) }
+                            if let Some(ref remap) = ci.remap { gt.decompress_with_remap(&chunk_sand, &tensor, Some(remap.clone())) }
                             else { tensor.decompress_all_global(&chunk_sand, gt) }
                         } else { tensor.decompress_all(&chunk_sand) };
 
@@ -235,7 +235,7 @@ impl ModelLoader {
                     None => { log::error!("chunk sandbag vanished for {} chunk {}", name, idx); continue; }
                 };
                 let decompressed = if let Some(ref gt) = global.as_ref() {
-                    if let Some(ref remap) = ci.remap { gt.decompress_with_remap(&chunk_sand, &tensor, remap) }
+                    if let Some(ref remap) = ci.remap { gt.decompress_with_remap(&chunk_sand, &tensor, Some(remap.clone())) }
                     else { tensor.decompress_all_global(&chunk_sand, gt) }
                 } else { tensor.decompress_all(&chunk_sand) };
 

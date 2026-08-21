@@ -9,7 +9,7 @@
 // Decode reverses the process: token ID → vocab string → reverse byte mapping
 // → UTF-8 decode.
 
-use crate::models::gguf::{GGUFFile, GGUFValue};
+use crate::models::formats::gguf::{GGUFFile, GGUFValue};
 use std::collections::HashMap;
 
 /// Serializable raw tokenizer data for storing to disk.

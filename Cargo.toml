@@ -48,6 +48,7 @@ ndarray = "0.16"
 half = "2"
 smallvec = "1"
 criterion = "0.5"
+hashbrown = "0.17.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -66,4 +67,8 @@ DATABASE_URL="postgres://ermer:ermer@localhost/agent_harness"
 
 [[bench]]
 name = "dequant_bench"
+harness = false
+
+[[bench]]
+name = "f16_convert_bench"
 harness = false

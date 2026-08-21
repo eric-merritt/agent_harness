@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -11,7 +11,7 @@ use super::common::{
     CompressJob, CompressResult, ConversionStats, TensorStats,
     compress_weights, resolve_params,
 };
-use super::safetensors::{SafetensorsHeader, SafetensorsDtype};
+use super::super::formats::safetensors::{SafetensorsHeader, SafetensorsDtype};
 
 pub fn normalize_tensor_name(name: &str) -> String {
     if name == "model.embed_tokens.weight" || name == "embed_tokens.weight" {

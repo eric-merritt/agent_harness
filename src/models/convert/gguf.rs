@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -14,8 +14,8 @@ use super::common::{
     CompressJob, CompressResult, CHUNK_SIZE,
     process_job,
 };
-use super::dedup_count::DedupCountTensor;
-use super::gguf::GGUFFile;
+
+use super::super::formats::gguf::{GGUFFile, quant_block_info};
 
 /// Convert a full GGUF model to compressed format.
 pub fn convert_gguf(
@@ -37,11 +37,11 @@ pub fn convert_gguf(
         let info = &gguf.tensor_info[i];
         let n_elems = info.element_count() as usize;
         let dtype = info.dtype;
-        if super::gguf::quant_block_info(dtype).is_none() && dtype != 0 && dtype != 1 && dtype != 30 {
+        if quant_block_info(dtype).is_none() && dtype != 0 && dtype != 1 && dtype != 30 {
             continue;
         }
         if n_elems == 0 { continue; }
-        let (block_elems, block_bytes) = super::gguf::quant_block_info(dtype).unwrap_or((1, 4));
+        let (block_elems, block_bytes) = quant_block_info(dtype).unwrap_or((1, 4));
         let blocks_per_chunk = (CHUNK_SIZE + block_elems - 1) / block_elems;
         let chunk_bytes = blocks_per_chunk * block_bytes;
         let total_bytes = info.byte_size() as usize;
@@ -131,7 +131,7 @@ pub fn convert_gguf(
         let mut file = File::open(&gguf_path_owned).map_err(|e| e.to_string())?;
         for (tpidx, (tidx, n_elems, dtype, nchunks)) in tensor_plan2.iter().enumerate() {
             let info = &gguf2.tensor_info[*tidx];
-            let (block_elems, block_bytes) = super::gguf::quant_block_info(*dtype).unwrap_or((1, 4));
+            let (block_elems, block_bytes) = crate::models::formats::gguf::quant_block_info(*dtype).unwrap_or((1, 4));
             let blocks_per_chunk = (CHUNK_SIZE + block_elems - 1) / block_elems;
             let chunk_bytes = blocks_per_chunk * block_bytes;
             let total_bytes = info.byte_size() as usize;

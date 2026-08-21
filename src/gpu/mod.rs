@@ -398,9 +398,16 @@ pub struct GpuDictionary {
 impl GpuDictionary {
     /// Create from a GlobalTable's CSR layout. Initializes GPU if needed.
     /// Returns None if no GPU is available.
-    pub fn create_from_global_table(gt: &crate::models::dedup_count::GlobalTable) -> Option<Self> {
+    pub fn create_from_global_table(gt: &crate::models::dedup::types::GlobalTable) -> Option<Self> {
         let gpu = GPU.get_or_init(init_gpu).as_ref()?;
-        Some(Self::create(&gpu.device, &gt.prefixes, &gt.flat_tails, &gt.tail_offsets))
+        // Flatten per-prefix tail vectors into CSR (flat tails + offsets)
+        let mut tail_offsets: Vec<u32> = Vec::with_capacity(gt.tails_for_prefix.len() + 1);
+        let mut flat_tails: Vec<u32> = Vec::new();
+        for tails in &gt.tails_for_prefix {
+            flat_tails.extend(tails.iter().copied());
+            tail_offsets.push(flat_tails.len() as u32);
+        }
+        Some(Self::create(&gpu.device, &gt.prefixes, &flat_tails, &tail_offsets))
     }
 
     /// Upload the GlobalTable CSR layout to GPU VRAM. Called once at startup.

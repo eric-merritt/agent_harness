@@ -5,7 +5,8 @@
 //   Back:  tail counts (reversed), then prefix counts (reversed).
 // Flags separate the sections. One instance of each unique value — no repeats.
 
-use super::dedup_count::{DedupCountTensor, DataFlag, UniqueTail};
+use crate::models::dedup::tensor::DedupCountTensor;
+use crate::models::dedup::types::{DataFlag, UniqueTail};
 
 /// Serialize the core dictionary using the bidirectional layout.
 pub fn serialize_core(tensor: &DedupCountTensor) -> Vec<u8> {

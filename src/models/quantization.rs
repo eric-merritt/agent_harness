@@ -434,6 +434,101 @@ pub fn quantized_bytes(n_elements: usize, group_size: usize) -> usize {
     n_groups(n_elements, group_size) * 4 + packed_bytes(n_elements)
 }
 
+/// Safe entry point that checks CPU features at runtime.
+/// Falls back to scalar processing if AVX-512 instructions are missing.
+pub fn dequant_layer(scales: &[f32], packed: &[u8], result: &mut [f32], group_size: usize) {
+    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && group_size == 32 {
+        unsafe { dequant_layer_avx512(scales, packed, result); }
+    } else {
+        // Safe fallback scalar loop
+        for i in 0..result.len() {
+            let group_idx = i / group_size;
+            let nibble = if i % 2 == 0 { 
+                packed[i / 2] & 0x0F 
+            } else { 
+                (packed[i / 2] >> 4) & 0x0F 
+            };
+            result[i] = (nibble as f32 - 8.0) * scales[group_idx];
+        }
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+pub unsafe fn dequant_layer_avx512(scales: &[f32], packed: &[u8], result: &mut [f32]) {
+    let n = result.len();
+    let chunks = n / 128;
+    
+    let v_offset = _mm512_set1_ps(-8.0);
+    let v_mask_low = _mm512_set1_epi8(0x0F);
+
+    for c in 0..chunks {
+        let byte_offset = c * 64;   
+        let float_offset = c * 128; 
+        let group_offset = c * 4;   
+
+        // 1. Load 64 packed bytes into ZMM
+        let raw_bytes = unsafe { _mm512_loadu_si512(packed.as_ptr().add(byte_offset) as *const _) };
+
+        // 2. Unpack low (even) and high (odd) nibbles
+        let bytes_even = _mm512_and_si512(raw_bytes, v_mask_low);
+        let bytes_odd = _mm512_and_si512(_mm512_srli_epi16(raw_bytes, 4), v_mask_low);
+
+        // 3. Interleave back into accurate linear element order
+        let lin_0_63 = _mm512_unpacklo_epi8(bytes_even, bytes_odd);
+        let lin_64_127 = _mm512_unpackhi_epi8(bytes_even, bytes_odd);
+
+        // 4. Convert to f32 and apply group scales (each block handles 32 items)
+        
+        // --- Block 0 (Elements 0-31, Scale Group 0) ---
+        let scale_0 = _mm512_set1_ps(scales[group_offset]);
+        
+        let chunk0_1 = _mm512_castsi512_si128(lin_0_63);
+        let chunk0_2 = _mm512_extracti32x4_epi32(lin_0_63, 1);
+        
+        let f0_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk0_1));
+        let f0_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk0_2));
+        
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset), _mm512_fmadd_ps(_mm512_add_ps(f0_1, v_offset), scale_0, _mm512_setzero_ps())) };
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 16), _mm512_fmadd_ps(_mm512_add_ps(f0_2, v_offset), scale_0, _mm512_setzero_ps())) };
+
+        // --- Block 1 (Elements 32-63, Scale Group 1) ---
+        let scale_1 = _mm512_set1_ps(scales[group_offset + 1]);
+        
+        let chunk1_1 = _mm512_extracti32x4_epi32(lin_0_63, 2);
+        let chunk1_2 = _mm512_extracti32x4_epi32(lin_0_63, 3);
+        
+        let f1_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk1_1));
+        let f1_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk1_2));
+        
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 32), _mm512_fmadd_ps(_mm512_add_ps(f1_1, v_offset), scale_1, _mm512_setzero_ps())) };
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 48), _mm512_fmadd_ps(_mm512_add_ps(f1_2, v_offset), scale_1, _mm512_setzero_ps())) };
+
+        // --- Block 2 (Elements 64-95, Scale Group 2) ---
+        let scale_2 = _mm512_set1_ps(scales[group_offset + 2]);
+        
+        let chunk2_1 = _mm512_castsi512_si128(lin_64_127);
+        let chunk2_2 = _mm512_extracti32x4_epi32(lin_64_127, 1);
+        
+        let f2_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk2_1));
+        let f2_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk2_2));
+        
+       unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 64), _mm512_fmadd_ps(_mm512_add_ps(f2_1, v_offset), scale_2, _mm512_setzero_ps())) };
+       unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 80), _mm512_fmadd_ps(_mm512_add_ps(f2_2, v_offset), scale_2, _mm512_setzero_ps())) };
+
+        // --- Block 3 (Elements 96-127, Scale Group 3) ---
+        let scale_3 = _mm512_set1_ps(scales[group_offset + 3]);
+        
+        let chunk3_1 = _mm512_extracti32x4_epi32(lin_64_127, 2);
+        let chunk3_2 = _mm512_extracti32x4_epi32(lin_64_127, 3);
+        
+        let f3_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk3_1));
+        let f3_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk3_2));
+        
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 96), _mm512_fmadd_ps(_mm512_add_ps(f3_1, v_offset), scale_3, _mm512_setzero_ps())) };
+        unsafe { _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 112), _mm512_fmadd_ps(_mm512_add_ps(f3_2, v_offset), scale_3, _mm512_setzero_ps())) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,102 +580,5 @@ mod tests {
 
         assert!(q0 > 0, "First weight should be positive, got {}", q0);
         assert!(q1 < 0, "Second weight should be negative, got {}", q1);
-    }
-}
-
-
-
-/// Safe entry point that checks CPU features at runtime.
-/// Falls back to scalar processing if AVX-512 instructions are missing.
-pub fn dequant_layer(scales: &[f32], packed: &[u8], result: &mut [f32], group_size: usize) {
-    if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && group_size == 32 {
-        unsafe { dequant_layer_avx512(scales, packed, result); }
-    } else {
-        // Safe fallback scalar loop
-        for i in 0..result.len() {
-            let group_idx = i / group_size;
-            let nibble = if i % 2 == 0 { 
-                packed[i / 2] & 0x0F 
-            } else { 
-                (packed[i / 2] >> 4) & 0x0F 
-            };
-            result[i] = (nibble as f32 - 8.0) * scales[group_idx];
-        }
-    }
-}
-
-#[target_feature(enable = "avx512f,avx512bw")]
-pub unsafe fn dequant_layer_avx512(scales: &[f32], packed: &[u8], result: &mut [f32]) {
-    let n = result.len();
-    let chunks = n / 128;
-    
-    let v_offset = _mm512_set1_ps(-8.0);
-    let v_mask_low = _mm512_set1_epi8(0x0F);
-
-    for c in 0..chunks {
-        let byte_offset = c * 64;   
-        let float_offset = c * 128; 
-        let group_offset = c * 4;   
-
-        // 1. Load 64 packed bytes into ZMM
-        let raw_bytes = _mm512_loadu_si512(packed.as_ptr().add(byte_offset) as *const _);
-
-        // 2. Unpack low (even) and high (odd) nibbles
-        let bytes_even = _mm512_and_si512(raw_bytes, v_mask_low);
-        let bytes_odd = _mm512_and_si512(_mm512_srli_epi16(raw_bytes, 4), v_mask_low);
-
-        // 3. Interleave back into accurate linear element order
-        let lin_0_63 = _mm512_unpacklo_epi8(bytes_even, bytes_odd);
-        let lin_64_127 = _mm512_unpackhi_epi8(bytes_even, bytes_odd);
-
-        // 4. Convert to f32 and apply group scales (each block handles 32 items)
-        
-        // --- Block 0 (Elements 0-31, Scale Group 0) ---
-        let scale_0 = _mm512_set1_ps(scales[group_offset]);
-        
-        let chunk0_1 = _mm512_castsi512_si128(lin_0_63);
-        let chunk0_2 = _mm512_extracti32x4_epi32(lin_0_63, 1);
-        
-        let f0_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk0_1));
-        let f0_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk0_2));
-        
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset), _mm512_fmadd_ps(_mm512_add_ps(f0_1, v_offset), scale_0, _mm512_setzero_ps()));
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 16), _mm512_fmadd_ps(_mm512_add_ps(f0_2, v_offset), scale_0, _mm512_setzero_ps()));
-
-        // --- Block 1 (Elements 32-63, Scale Group 1) ---
-        let scale_1 = _mm512_set1_ps(scales[group_offset + 1]);
-        
-        let chunk1_1 = _mm512_extracti32x4_epi32(lin_0_63, 2);
-        let chunk1_2 = _mm512_extracti32x4_epi32(lin_0_63, 3);
-        
-        let f1_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk1_1));
-        let f1_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk1_2));
-        
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 32), _mm512_fmadd_ps(_mm512_add_ps(f1_1, v_offset), scale_1, _mm512_setzero_ps()));
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 48), _mm512_fmadd_ps(_mm512_add_ps(f1_2, v_offset), scale_1, _mm512_setzero_ps()));
-
-        // --- Block 2 (Elements 64-95, Scale Group 2) ---
-        let scale_2 = _mm512_set1_ps(scales[group_offset + 2]);
-        
-        let chunk2_1 = _mm512_castsi512_si128(lin_64_127);
-        let chunk2_2 = _mm512_extracti32x4_epi32(lin_64_127, 1);
-        
-        let f2_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk2_1));
-        let f2_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk2_2));
-        
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 64), _mm512_fmadd_ps(_mm512_add_ps(f2_1, v_offset), scale_2, _mm512_setzero_ps()));
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 80), _mm512_fmadd_ps(_mm512_add_ps(f2_2, v_offset), scale_2, _mm512_setzero_ps()));
-
-        // --- Block 3 (Elements 96-127, Scale Group 3) ---
-        let scale_3 = _mm512_set1_ps(scales[group_offset + 3]);
-        
-        let chunk3_1 = _mm512_extracti32x4_epi32(lin_64_127, 2);
-        let chunk3_2 = _mm512_extracti32x4_epi32(lin_64_127, 3);
-        
-        let f3_1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk3_1));
-        let f3_2 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(chunk3_2));
-        
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 96), _mm512_fmadd_ps(_mm512_add_ps(f3_1, v_offset), scale_3, _mm512_setzero_ps()));
-        _mm512_storeu_ps(result.as_mut_ptr().add(float_offset + 112), _mm512_fmadd_ps(_mm512_add_ps(f3_2, v_offset), scale_3, _mm512_setzero_ps()));
     }
 }

@@ -1,7 +1,7 @@
 // Model configuration — supports both Qwen3.5 (GGUF) and Qwen2 (HuggingFace) formats.
 
 use serde::{Serialize, Deserialize};
-use crate::models::gguf::{GGUFFile, GGUFValue};
+use crate::models::formats::gguf::{GGUFFile, GGUFValue};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {

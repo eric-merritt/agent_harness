@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::ModelAdapter;
+use super::super::adapters::ModelAdapter;
 use crate::augment::augment::{TensorDescriptor, TensorDtype};
 
 pub struct PtFile {

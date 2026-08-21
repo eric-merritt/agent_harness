@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::ModelAdapter;
+use super::super::adapters::ModelAdapter;
+use super::super::formats::gguf;
 use crate::augment::augment::{TensorDescriptor, TensorDtype};
 
 pub struct SafetensorsFile {
@@ -165,10 +166,10 @@ impl SafetensorsDtype {
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
             SafetensorsDtype::F16 => raw.chunks_exact(2)
-                .map(|c| super::gguf::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .map(|c| gguf::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
             SafetensorsDtype::BF16 => raw.chunks_exact(2)
-                .map(|c| super::gguf::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .map(|c| gguf::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect(),
             _ => vec![0.0; n_elems],
         }

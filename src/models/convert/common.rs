@@ -2,59 +2,8 @@
 //
 // Used by the GGUF, safetensors, and quantization conversion pipelines.
 
-use super::core as core_io;
-use super::dedup_count::DedupCountTensor;
-use std::arch::x86_64::*;
-
-/// High-speed AVX-512 preprocessing step for your custom format compilation.
-/// Extracts base prefixes, raw fractional tail bits, and sign structures 
-/// simultaneously across 16 elements per step before serialization.
-#[target_feature(enable = "avx512f")]
-pub unsafe fn avx512_preprocess_conversion_chunk(
-    weights: &[f32],
-    prefix_digits: usize,
-    out_prefixes: &mut [f32],
-    out_tails: &mut [u16],
-) {
-    let n = weights.len();
-    let chunks_16 = n / 16;
-    
-    // Compute your format scaling factors using parallel vector steps
-    let scale_factor = 10f32.powi(prefix_digits as i32);
-    let inv_scale_factor = 1.0 / scale_factor;
-    let tail_scale = 10f32.powi((5 - prefix_digits as i32).max(0)) * 65535.0;
-
-    let v_scale = _mm512_set1_ps(scale_factor);
-    let v_inv_scale = _mm512_set1_ps(inv_scale_factor);
-    let v_tail_scale = _mm512_set1_ps(tail_scale);
-
-    for i in 0..chunks_16 {
-        let offset = i * 16;
-
-        // 1. Load 16 uncompressed floats from your incoming GGUF/Safetensors block
-        let v_w = _mm512_loadu_ps(weights.as_ptr().add(offset));
-
-        // 2. Perform your format's exact prefix truncation in parallel
-        // (Replaces individual w * scale logic completely)
-        let v_scaled = _mm512_mul_ps(v_w, v_scale);
-        let v_trunc = _mm512_roundscale_ps(v_scaled, _MM_FROUND_TO_ZERO);
-        let v_prefix = _mm512_mul_ps(v_trunc, v_inv_scale);
-
-        // 3. Isolate the target tail delta segments 
-        let v_tail = _mm512_sub_ps(v_w, v_prefix);
-        let v_tail_scaled = _mm512_roundscale_ps(_mm512_mul_ps(v_tail, v_tail_scale), _MM_FROUND_TO_NEAREST_INT);
-
-        // 4. Stream prefixes directly to the formatting block
-        _mm512_storeu_ps(out_prefixes.as_mut_ptr().add(offset), v_prefix);
-
-        // 5. Convert and compress the floating-point tails into 16-bit integers
-        let v_tail_epi32 = _mm512_cvtps_epi32(v_tail_scaled);
-        
-        // Downcast 32-bit vector registers down into packed 16-bit elements
-        let v_tail_epu16 = _mm512_cvtepi32_epi16(v_tail_epi32);
-        _mm256_storeu_si256(out_tails.as_mut_ptr().add(offset) as *mut _, v_tail_epu16);
-    }
-}
+use crate::models::dedup::tensor::DedupCountTensor;
+pub use crate::models::avx512_kernel::avx512_preprocess_conversion_chunk;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TensorStats {
@@ -155,7 +104,7 @@ pub fn compress_weights(weights: &[f32], pd: usize, tr: usize) -> CompressOutput
 
         for chunk in weights.chunks(CHUNK_SIZE) {
             let (t, m) = DedupCountTensor::compress(chunk, pd, tr);
-            core.extend(core_io::serialize_core(&t));
+            core.extend(super::core::serialize_core(&t));
             sandbag.extend(m.to_bytes());
             prefix_count += t.prefixes.len();
             unique_tail_count += t.unique_tail_count();
@@ -175,7 +124,7 @@ pub fn compress_weights(weights: &[f32], pd: usize, tr: usize) -> CompressOutput
         };
     } else {
         let (t, m) = DedupCountTensor::compress(weights, pd, tr);
-        let core = core_io::serialize_core(&t);
+        let core = super::core::serialize_core(&t);
         let sandbag = m.to_bytes();
         let mut full_core = Vec::new();
         full_core.extend_from_slice(&1u32.to_le_bytes());
@@ -214,7 +163,7 @@ pub fn compress_weights_gpu(weights: &[f32], pd: usize, tr: usize) -> Option<Com
     let (t, m) = DedupCountTensor::compress_from_gpu(
         weights, &gpu_out.prefix_bits, &gpu_out.tails, &gpu_out.signs, pd, tr
     );
-    let core = core_io::serialize_core(&t);
+    let core = super::core::serialize_core(&t);
     let sandbag = m.to_bytes();
     let mut full_core = Vec::new();
     full_core.extend_from_slice(&1u32.to_le_bytes());
@@ -289,4 +238,14 @@ pub struct CompressResult {
     pub stats: TensorStats,
     pub core: Vec<u8>,
     pub sandbag: Vec<u8>,
+}
+
+impl ConversionStats {
+    pub fn to_binary_cache(&self, dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let bin_path = dir.join("manifest.bin");
+        if let Ok(data) = bincode::serialize(self) {
+            let _ = std::fs::write(bin_path, data);
+        }
+        Ok(())
+    }
 }
