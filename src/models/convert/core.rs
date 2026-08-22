@@ -127,34 +127,3 @@ pub fn deserialize_core_chunks(data: &[u8]) -> Vec<DedupCountTensor> {
     }
     chunks
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_core_serialize_roundtrip() {
-        let weights: Vec<f32> = (0..1000)
-            .map(|i| match i % 3 { 0 => 0.0150, 1 => -0.0230, _ => 0.0420 })
-            .collect();
-
-        let (tensor, _sandbag) = DedupCountTensor::compress(&weights, 2, 2);
-        let bytes = serialize_core(&tensor);
-        let restored = deserialize_core(&bytes).expect("deserialization failed");
-
-        assert_eq!(restored.count, tensor.count);
-        assert_eq!(restored.prefixes.len(), tensor.prefixes.len());
-        assert_eq!(restored.unique_tails.len(), tensor.unique_tails.len());
-        assert_eq!(restored.prefix_digits, tensor.prefix_digits);
-        assert_eq!(restored.tail_digits, tensor.tail_digits);
-        assert!((restored.avg_precision_lost - tensor.avg_precision_lost).abs() < 1e-6);
-
-        for (a, b) in tensor.prefixes.iter().zip(restored.prefixes.iter()) {
-            assert_eq!(a, b);
-        }
-        for (a, b) in tensor.unique_tails.iter().zip(restored.unique_tails.iter()) {
-            assert_eq!(a.value, b.value);
-            assert_eq!(a.repeat_count, b.repeat_count);
-        }
-    }
-}

@@ -16,7 +16,7 @@ use crate::messaging::chat_interface::ChatInterface;
 use crate::messaging::layout::DefaultLayout;
 use crate::messaging::mcp_config::{McpConfig, SavedMcpServer};
 use crate::models::server::ModelServer;
-use crate::progress::LoadingProgress;
+use crate::inference::progress::LoadingProgress;
 use crate::ui_ux::components::mcp_panel::{McpPanel, McpToolNode};
 use crate::ui_ux::components::mcp_modal::{McpModal, ModalAction, ConfigState};
 use crate::ui_ux::components::tools_panel::ToolsPanel;

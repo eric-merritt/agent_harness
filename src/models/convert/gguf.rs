@@ -11,9 +11,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use super::common::{
-    CompressJob, CompressResult, CHUNK_SIZE,
-    process_job,
+    CompressJob, CompressResult, CHUNK_SIZE, resolve_params
 };
+
+use super::super::dedup::tensor::DedupCountTensor;
 
 use super::super::formats::gguf::{GGUFFile, quant_block_info};
 
@@ -100,7 +101,36 @@ pub fn convert_gguf(
                     rx.recv()
                 };
                 let job = match job { Ok(j) => j, Err(_) => break };
-                let _ = result_tx.send(process_job(&job, prefix_digits, truncate_rounds, true));
+                let n_elems = job.element_count;
+                let orig_bytes = n_elems * 4;
+                let (pd, tr) = resolve_params(&job.name, prefix_digits, truncate_rounds);
+                let out = DedupCountTensor::compress_job(&job.weights, pd, tr);
+                let _ = result_tx.send(CompressResult {
+                    global_idx: job.global_idx,
+                    stats: TensorStats {
+                        name: job.name.clone(),
+                        shape: job.shape.clone(),
+                        gguf_dtype: 0,
+                        element_count: n_elems,
+                        original_bytes: orig_bytes,
+                        core_bytes: out.core.len(),
+                        sandbag_bytes: out.sandbag.len(),
+                        core_ratio: orig_bytes as f32 / out.core.len().max(1) as f32,
+                        prefix_count: out.prefix_count,
+                        unique_tail_count: out.unique_tail_count,
+                        shared_weights: out.shared_weights,
+                        mean_precision_lost: out.mean_precision_lost,
+                        weight_offset: 0,
+                        sandbag_offset: 0,
+                        full_precision: out.full_precision,
+                        quant_offset: 0,
+                        quant_bytes: 0,
+                        is_4bit: false,
+                        group_size: 32,
+                    },
+                    core: out.core,
+                    sandbag: out.sandbag,
+                });
             }
         })
     };
@@ -116,7 +146,36 @@ pub fn convert_gguf(
                     rx.recv()
                 };
                 let job = match job { Ok(j) => j, Err(_) => break };
-                let _ = result_tx.send(process_job(&job, prefix_digits, truncate_rounds, false));
+                let n_elems = job.element_count;
+                let orig_bytes = n_elems * 4;
+                let (pd, tr) = resolve_params(&job.name, prefix_digits, truncate_rounds);
+                let out = DedupCountTensor::compress_job(&job.weights, pd, tr);
+                let _ = result_tx.send(CompressResult {
+                    global_idx: job.global_idx,
+                    stats: TensorStats {
+                        name: job.name.clone(),
+                        shape: job.shape.clone(),
+                        gguf_dtype: 0,
+                        element_count: n_elems,
+                        original_bytes: orig_bytes,
+                        core_bytes: out.core.len(),
+                        sandbag_bytes: out.sandbag.len(),
+                        core_ratio: orig_bytes as f32 / out.core.len().max(1) as f32,
+                        prefix_count: out.prefix_count,
+                        unique_tail_count: out.unique_tail_count,
+                        shared_weights: out.shared_weights,
+                        mean_precision_lost: out.mean_precision_lost,
+                        weight_offset: 0,
+                        sandbag_offset: 0,
+                        full_precision: out.full_precision,
+                        quant_offset: 0,
+                        quant_bytes: 0,
+                        is_4bit: false,
+                        group_size: 32,
+                    },
+                    core: out.core,
+                    sandbag: out.sandbag,
+                });
             }
         })
     }).collect();
@@ -187,7 +246,7 @@ pub fn convert_gguf(
             Ok(r) => r,
             Err(_) => return Err("worker channel closed unexpectedly".into()),
         };
-        received += 1;
+        received = received + 1;
         buffer.insert(result.global_idx, (result.core, result.sandbag, result.stats));
 
         while let Some((core, sandbag, stats)) = buffer.remove(&expected_chunk) {
@@ -195,8 +254,8 @@ pub fn convert_gguf(
             sandbag_file.write_all(&sandbag)?;
             let (tpidx, _c) = chunk_lookup[expected_chunk];
             tensor_chunk_stats[tpidx].push(stats);
-            woff += core.len() as u64;
-            moff += sandbag.len() as u64;
+            woff = woff + core.len() as u64;
+            moff = moff + sandbag.len() as u64;
             expected_chunk += 1;
         }
     }

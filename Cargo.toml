@@ -49,6 +49,7 @@ half = "2"
 smallvec = "1"
 criterion = "0.5"
 hashbrown = "0.17.1"
+derive_more = { version = "2.1.1", features = [ "into" ] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -61,6 +62,10 @@ path = "src/lib.rs"
 name = "agent_harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "convert"
+path = "src/bin/convert.rs"
+
 [env]
 DATABASE_URL="postgres://ermer:ermer@localhost/agent_harness"
 
@@ -71,4 +76,8 @@ harness = false
 
 [[bench]]
 name = "f16_convert_bench"
+harness = false
+
+[[bench]]
+name = "compress_bench"
 harness = false

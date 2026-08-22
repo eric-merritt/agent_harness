@@ -572,7 +572,7 @@ mod tests {
         weights[1] = -0.7;
         weights[2] = 0.0;
 
-        let (scales, packed) = quantize(&weights, GROUP_SIZE);
+        let (_scales, packed) = quantize(&weights, GROUP_SIZE);
 
         let b = packed[0];
         let q0 = (b & 0x0F) as i32 - 8;

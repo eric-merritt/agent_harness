@@ -44,7 +44,7 @@ fn main() {
 
     if let Some(gguf) = extract_meta {
         println!("Extracting metadata from GGUF: {}", gguf);
-        let gguf_file = agent_harness::models::gguf::GGUFFile::from_file(Path::new(&gguf))
+        let gguf_file = agent_harness::models::formats::gguf::GGUFFile::from_file(Path::new(&gguf))
             .expect("Failed to parse GGUF");
         let config = agent_harness::inference::config::ModelConfig::from_gguf(&gguf_file);
         config.to_file(out_path).expect("Failed to write config.json");
@@ -57,9 +57,7 @@ fn main() {
     if let Some(gguf) = gguf_path {
         eprintln!("Converting GGUF: {}", gguf);
         eprintln!("  prefix_digits={}, truncate_rounds={}, workers={}", prefix_digits, truncate_rounds, workers);
-        let tail_width = if truncate_rounds >= 3 { "u8" } else { "u16" };
-        eprintln!("  tail_idx storage: {} (truncate_rounds={})", tail_width, truncate_rounds);
-        let stats = agent_harness::models::convert::convert_gguf(
+        let stats = agent_harness::models::convert::gguf::convert_gguf(
             Path::new(&gguf), out_path, prefix_digits, truncate_rounds, workers,
         ).expect("GGUF conversion failed");
         print_summary(&stats);
@@ -77,7 +75,7 @@ fn main() {
         }
         shards.sort();
         println!("Found {} shards, {} workers", shards.len(), workers);
-        let stats = agent_harness::models::convert::convert_safetensors_parallel(
+        let stats = agent_harness::models::convert::safetensors::convert_safetensors_parallel(
             &shards, out_path, prefix_digits, truncate_rounds, workers,
         ).expect("safetensors conversion failed");
         print_summary(&stats);
@@ -98,17 +96,27 @@ fn print_usage() {
     eprintln!("  --out <dir>                Output directory (default: output/converted)");
     eprintln!("  --prefix-digits <n>        Prefix digits for compression (default: 2)");
     eprintln!("  --truncate-rounds <n>      Tail truncation rounds (default: 2)");
-    eprintln!("  --workers <n>              Worker threads (default: 24)");
+    eprintln!("  --workers <n>              Number of worker threads (default: 24)");
+    eprintln!("  --help, -h                 Show this help");
 }
 
-fn print_summary(stats: &agent_harness::models::convert::ConversionStats) {
-    println!("\n═══ Conversion Complete ═══");
-    println!("  Tensors:         {}", stats.tensor_count);
-    println!("  Original (f32):  {:.2} GB", stats.total_original_bytes as f64 / 1e9);
-    println!("  Core weights:    {:.2} GB", stats.total_core_bytes as f64 / 1e9);
-    println!("  Sandbag:         {:.2} GB", stats.total_sandbag_bytes as f64 / 1e9);
-    println!("  Core ratio:      {:.2}x", stats.overall_core_ratio);
-    println!("  Total ratio:     {:.2}x",
-        stats.total_original_bytes as f32
-        / (stats.total_core_bytes + stats.total_sandbag_bytes) as f32);
+fn print_summary(stats: &agent_harness::models::convert::common::ConversionStats) {
+    let orig_mb = stats.total_original_bytes as f64 / 1_048_576.0;
+    let core_mb = stats.total_core_bytes as f64 / 1_048_576.0;
+    let sand_mb = stats.total_sandbag_bytes as f64 / 1_048_576.0;
+    let ratio = if stats.total_core_bytes > 0 {
+        stats.total_original_bytes as f64 / stats.total_core_bytes as f64
+    } else { 1.0 };
+    println!();
+    println!("Model: {}", stats.model_name);
+    println!("Tensors: {}", stats.tensor_count);
+    println!("Original: {:.1} MB", orig_mb);
+    println!("Core:     {:.1} MB", core_mb);
+    println!("Sandbag:  {:.1} MB", sand_mb);
+    println!("Ratio:    {:.2}x", ratio);
+    for t in &stats.tensors {
+        if t.full_precision {
+            println!("  [FP]  {}", t.name);
+        }
+    }
 }

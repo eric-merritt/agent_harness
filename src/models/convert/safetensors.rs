@@ -9,8 +9,9 @@ use std::thread;
 
 use super::common::{
     CompressJob, CompressResult, ConversionStats, TensorStats,
-    compress_weights, resolve_params,
+    resolve_params,
 };
+use super::super::dedup::tensor::DedupCountTensor;
 use super::super::formats::safetensors::{SafetensorsHeader, SafetensorsDtype};
 
 pub fn normalize_tensor_name(name: &str) -> String {
@@ -90,7 +91,7 @@ pub fn convert_safetensors(
         let weights = info.dtype.dequantize_to_f32(raw, n_elems);
 
         let (pd, tr) = resolve_params(&name, prefix_digits, truncate_rounds);
-        let out = compress_weights(&weights, pd, tr);
+        let out = DedupCountTensor::compress_job(&weights, pd, tr);
         let orig_bytes = n_elems * 4;
         let core_len = out.core.len() as u64;
         let sandbag_len = out.sandbag.len() as u64;
@@ -178,7 +179,7 @@ pub fn convert_safetensors_parallel(
                 let job = { let rx = job_rx.lock().unwrap(); rx.recv() };
                 let job = match job { Ok(j) => j, Err(_) => break };
                 let (pd, tr) = resolve_params(&job.name, prefix_digits, truncate_rounds);
-                let out = compress_weights(&job.weights, pd, tr);
+                let out = DedupCountTensor::compress_job(&job.weights, pd, tr);
 
                 let _ = result_tx.send(CompressResult {
                     global_idx: job.global_idx,

@@ -5,7 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use uuid::Uuid;
 use memmap2::Mmap;
-use super::avx512_kernel;
+use crate::models::avx512_kernel::*;
 use super::common::{ConversionStats, TensorStats};
 use super::core::*;
 use crate::models::dedup::types::Sandbag;
@@ -112,7 +112,7 @@ impl ModelLoader {
     }
 }
 
-struct ChunkInfo {
+pub struct ChunkInfo {
     core_pos: usize,
     sand_pos: usize,
     element_count: usize,

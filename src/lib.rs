@@ -12,4 +12,3 @@ pub mod messaging;
 pub mod models;
 pub mod gpu;
 pub mod inference;
-pub mod progress;

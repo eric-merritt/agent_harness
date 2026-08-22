@@ -18,6 +18,7 @@ pub mod attention;
 pub mod ffn;
 pub mod sampling;
 pub mod kv_cache;
+pub mod progress;
 
 use std::path::{Path, PathBuf};
 use std::io::{Seek, SeekFrom, Read, Write};
@@ -25,7 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::fs::File;
 
-use crate::models::convert::{ModelLoader, deserialize_core_chunks};
+use crate::models::convert::loader::{ModelLoader};
+use crate::models::convert::core::deserialize_core_chunks;
 use crate::models::dedup::types::GlobalTable;
 use crate::models::dedup::tensor::DedupCountTensor;
 use config::ModelConfig;
@@ -69,7 +71,7 @@ impl InferenceEngine {
     }
         pub fn open_with_progress(
         model_dir: &Path,
-        progress: Option<&crate::progress::LoadingProgress>,
+        progress: Option<&progress::LoadingProgress>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         log::info!("InferenceEngine: opening model from {}", model_dir.display());
         if let Some(p) = progress { p.set(6, "Reading model config..."); }
@@ -184,7 +186,7 @@ impl InferenceEngine {
     pub fn decompress_all_parallel(
         &mut self,
         num_workers: usize,
-        progress: Option<&crate::progress::LoadingProgress>,
+        progress: Option<&progress::LoadingProgress>,
     ) {
         use std::sync::{mpsc, Mutex};
         use std::thread;
@@ -241,7 +243,7 @@ impl InferenceEngine {
                 let tx = tx.clone();
                 
                 thread::spawn(move || {
-                    let mut loader = match ModelLoader::open(&dir) {
+                    let loader = match ModelLoader::open(&dir) {
                         Ok(l) => l,
                         Err(e) => {
                             log::error!("Worker: failed to open ModelLoader: {}", e);

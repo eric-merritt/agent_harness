@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::layout::HorizontalAlignment;
 use crate::ui_ux::theme::{Theme, ThemeName};
 
-use crate::progress::LoadingProgress;
+use crate::inference::progress::LoadingProgress;
 
 const RETRO_THEME: ThemeName = ThemeName::Retro;
 // Three magenta tones — same as submit_button.rs.

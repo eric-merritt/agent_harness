@@ -22,7 +22,8 @@ use crate::augment::augment::{
     WeightPlacementPlan, TensorPlacement,
 };
 use crate::inference::InferenceEngine;
-use super::convert::{ConversionStats, ModelLoader, TensorStats};
+use super::convert::loader::ModelLoader;
+use super::convert::common::{ConversionStats, TensorStats};
 
 /// Running model server. Holds the augment bus, loader, and inference engine.
 pub struct ModelServer {
@@ -41,7 +42,7 @@ impl ModelServer {
     }
 
     /// Open with optional progress tracking for UI integration.
-    pub fn open_with_progress(model_dir: &Path, progress: Option<&crate::progress::LoadingProgress>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn open_with_progress(model_dir: &Path, progress: Option<&crate::inference::progress::LoadingProgress>) -> Result<Self, Box<dyn std::error::Error>> {
         if let Some(p) = progress { p.set(1, "Reading manifest..."); }
         let loader = ModelLoader::open(model_dir)?;
         if let Some(p) = progress { p.set(3, "Building tensor map..."); }

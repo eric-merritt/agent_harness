@@ -1,6 +1,3 @@
-use std::ops::Not;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DataFlags {
     UncompressedFlag = 0xFF,
@@ -20,11 +17,3 @@ impl DataFlags {
         !(self as u8)
     }
 }
-
-// impl Not for DataFlags {
-//     type Output = u8;
-//     #[inline(always)]
-//     fn not(self) -> Self::Output {
-//         !(self as u8)
-//     }
-// }
