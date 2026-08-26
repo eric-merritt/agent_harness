@@ -6,7 +6,8 @@
 use std::arch::x86_64::*;
 use hashbrown::HashMap as AHashMap;
 use super::convert::common::{CompressJob, CompressOutput, CHUNK_SIZE};
-use super::dedup::types::{Sandbag, UniqueTail};
+use super::dedupe::types::{Sandbag, UniqueTail};
+use super::dedupe::truncation::quantize_block;
 
 #[target_feature(enable = "avx512f")]
 pub unsafe fn compress_job_avx512(
@@ -15,7 +16,7 @@ pub unsafe fn compress_job_avx512(
     truncate_rounds: usize,
 ) -> CompressOutput {
     // Keep exact signatures and variable initializations
-    use crate::models::dedup::tensor::DedupCountTensor;
+    use crate::models::dedupe::tensor::DedupCountTensor;
 
     let weights = &job.weights;
     let n = weights.len();
@@ -24,8 +25,8 @@ pub unsafe fn compress_job_avx512(
     let prefix_scale = 10f32.powi(prefix_digits as i32);
     let tail_scale = 10f32.powi(DedupCountTensor::TOTAL_DIGITS as i32);
 
-    let mut prefix_map: AHashMap<u16, u16> = AHashMap::with_capacity(512);
-    let mut prefixes: Vec<u16> = Vec::with_capacity(512);
+    let mut prefix_map: AHashMap<u32, u16> = AHashMap::with_capacity(512);
+    let mut prefixes: Vec<u32> = Vec::with_capacity(512);
     let mut prefix_idx = vec![0u16; n]; 
     let mut sign_bits = vec![0u8; (n + 7) / 8];
     let mut group_tails: Vec<Vec<u32>> = Vec::new();
@@ -83,7 +84,7 @@ pub unsafe fn compress_job_avx512(
 
         // Standard zero-allocation grouping pass for the extracted vector channels
         for i in 0..16 {
-            let p_int = temp_prefixes[i] as u16;
+            let p_int = temp_prefixes[i] as u32;
             let t_int = temp_tails[i] as u32;
             let idx = offset + i;
 
@@ -108,7 +109,7 @@ pub unsafe fn compress_job_avx512(
         let idx = rem_offset + i;
         let sign = w < 0.0;
         let abs_w = w.abs();
-        let p_int = (abs_w * prefix_scale).floor() as u16;
+        let p_int = (abs_w * prefix_scale).floor() as u32;
         let t_val = abs_w - (p_int as f32 / prefix_scale);
         let t_int = (t_val * tail_scale).round() as u32;
 
@@ -222,7 +223,7 @@ pub unsafe fn compress_job_avx512(
         .collect();
 
     let unique_tails: Vec<UniqueTail> = unique_tail_values.iter().map(|&v| {
-        UniqueTail { value: v, repeat_count: tail_counts[&v] }
+        UniqueTail { value: v as u32, repeat_count: tail_counts[&v] }
     }).collect();
 
     // ── Step 4: Map indices using your existing kernel layout ──
@@ -252,8 +253,10 @@ pub unsafe fn compress_job_avx512(
 
     // Package the results to match your structure mapping requirements
 
+    // Convert prefixes to u8 (only low byte matters for 2-digit prefix)
+    let prefixes_u8: Vec<u8> = prefixes.iter().map(|&p| (p & 0xFF) as u8).collect();
     let tensor = DedupCountTensor {
-        prefixes,
+        prefixes: prefixes_u8,
         prefix_counts,
         unique_tails,
         count: n,
@@ -262,7 +265,51 @@ pub unsafe fn compress_job_avx512(
         avg_precision_lost: global_avg_lost,
     };
     let serialized_core = crate::models::convert::core::serialize_core(&tensor);
-    let sandbag = Sandbag { prefix_idx, tail_idx, tail_width: if truncate_rounds >= 3 { 0 } else { 1 }, sign_bits, count: n };
+
+    // Build sandbag from quantization results using prefix/tail split
+    let (scale, outliers) = quantize_block(weights);
+    let prefix_scale = 10f32.powi(prefix_digits as i32);
+    let tail_scale = 10_000_000.0f32;
+
+    let mut prefix_map: AHashMap<u32, u16> = AHashMap::new();
+    let mut unique_prefixes: Vec<u8> = Vec::new();
+    let mut tail_map: AHashMap<u32, u16> = AHashMap::new();
+    let mut unique_tails_vec: Vec<u32> = Vec::new();
+    let mut manifest = Vec::with_capacity(n);
+    let mut signs = vec![0u8; (n + 7) / 8];
+
+    for (i, &w) in weights.iter().enumerate() {
+        let abs_w = w.abs();
+        if w < 0.0 {
+            signs[i / 8] |= 1 << (i % 8);
+        }
+        let p_int = (abs_w * prefix_scale).floor() as u32;
+        let p_int_u8 = (p_int & 0xFF) as u8;
+        let tail_val = abs_w - (p_int as f32) / prefix_scale;
+        let t_int = (tail_val * tail_scale).round() as u32;
+        let p_idx = *prefix_map.entry(p_int).or_insert_with(|| {
+            let idx = unique_prefixes.len() as u16;
+            unique_prefixes.push(p_int_u8);
+            idx
+        });
+        let t_idx = *tail_map.entry(t_int).or_insert_with(|| {
+            let idx = unique_tails_vec.len() as u16;
+            unique_tails_vec.push(t_int);
+            idx
+        });
+        manifest.push((p_idx, t_idx));
+    }
+
+    let sandbag = Sandbag {
+        scale,
+        outliers,
+        count: n,
+        prefix_digits,
+        unique_prefixes,
+        unique_tails: unique_tails_vec,
+        manifest,
+        signs,
+    };
 
     CompressOutput {
         core: serialized_core,
@@ -568,6 +615,72 @@ pub fn f16_to_f32_scalar(h: u16) -> f32 {
     }
 }
 
+/// Reconstruct f32 weights from GPU-produced prefix_ints, tails, signs using AVX-512.
+/// 32 elements per iteration (prefix_ints + tails + signs are u32 each).
+#[target_feature(enable = "avx512f")]
+pub unsafe fn avx512_reconstruct_from_gpu(
+    prefix_ints: &[u32],
+    tails: &[u32],
+    signs: &[u32],
+    prefix_scale: f32,
+    out_weights: &mut [f32],
+) {
+    let n = prefix_ints.len();
+    let chunks_32 = n / 32;
+    let v_prefix_scale = _mm512_set1_ps(prefix_scale);
+    let v_tail_divisor = _mm512_set1_ps(10_000_000.0);
+    let v_sign_mask_bits = _mm512_set1_ps(-0.0);
+
+    for c in 0..chunks_32 {
+        let offset = c * 32;
+
+        // Load 32 prefix_ints (two lots of 16)
+        let p_lo = unsafe { _mm512_loadu_si512(prefix_ints.as_ptr().add(offset) as *const _) };
+        let p_hi = unsafe { _mm512_loadu_si512(prefix_ints.as_ptr().add(offset + 16) as *const _) };
+
+        // Load 32 tails
+        let t_lo = unsafe { _mm512_loadu_si512(tails.as_ptr().add(offset) as *const _) };
+        let t_hi = unsafe { _mm512_loadu_si512(tails.as_ptr().add(offset + 16) as *const _) };
+
+        // Load 32 signs (packed as u32 0/1)
+        let s_lo = unsafe { _mm512_loadu_si512(signs.as_ptr().add(offset) as *const _) };
+        let s_hi = unsafe { _mm512_loadu_si512(signs.as_ptr().add(offset + 16) as *const _) };
+
+        // prefix_val = prefix_int / prefix_scale
+        let f_p_lo = _mm512_div_ps(_mm512_cvtepu32_ps(p_lo), v_prefix_scale);
+        let f_p_hi = _mm512_div_ps(_mm512_cvtepu32_ps(p_hi), v_prefix_scale);
+
+        // tail_val = tail / 10_000_000.0
+        let f_t_lo = _mm512_div_ps(_mm512_cvtepu32_ps(t_lo), v_tail_divisor);
+        let f_t_hi = _mm512_div_ps(_mm512_cvtepu32_ps(t_hi), v_tail_divisor);
+
+        // abs_w = prefix_val + tail_val
+        let abs_lo = _mm512_add_ps(f_p_lo, f_t_lo);
+        let abs_hi = _mm512_add_ps(f_p_hi, f_t_hi);
+
+        // sign mask: sign != 0 → negative
+        let k_sign_lo = _mm512_cmp_epu32_mask(s_lo, _mm512_setzero_si512(), _MM_CMPINT_NE);
+        let k_sign_hi = _mm512_cmp_epu32_mask(s_hi, _mm512_setzero_si512(), _MM_CMPINT_NE);
+
+        // Apply sign: if sign != 0 → -abs_w, else abs_w
+        let v_final_lo = _mm512_mask_blend_ps(k_sign_lo, abs_lo, _mm512_mul_ps(abs_lo, _mm512_set1_ps(-1.0)));
+        let v_final_hi = _mm512_mask_blend_ps(k_sign_hi, abs_hi, _mm512_mul_ps(abs_hi, _mm512_set1_ps(-1.0)));
+
+        unsafe {
+            _mm512_storeu_ps(out_weights.as_mut_ptr().add(offset), v_final_lo);
+            _mm512_storeu_ps(out_weights.as_mut_ptr().add(offset + 16), v_final_hi);
+        }
+    }
+
+    // Scalar remainder
+    for i in (chunks_32 * 32)..n {
+        let prefix_val = (prefix_ints[i] as f32) / prefix_scale;
+        let tail_val = (tails[i] as f32) / 10_000_000.0;
+        let abs_w = prefix_val + tail_val;
+        out_weights[i] = if signs[i] != 0 { -abs_w } else { abs_w };
+    }
+}
+
 /// High-speed AVX-512 full precision deserialization fallback pass.
 /// Processes 16 raw single-precision floating point elements (64 bytes) per iteration loop.
 #[target_feature(enable = "avx512f")]
@@ -623,5 +736,106 @@ pub unsafe fn avx512_stream_stitch(src: &[f32], dest: &mut [f32], offset: usize)
     let processed = chunks_16 * 16;
     if processed < src.len() {
         dest[offset + processed..offset + src.len()].copy_from_slice(&src[processed..]);
+    }
+}
+
+/// Configuration containing decimal divisors for the AVX-512 pipeline
+pub struct SimdSplitConfig {
+    /// Reciprocal of the tail divisor (e.g., if divisor is 10000.0, this is 1.0 / 10000.0)
+    /// Multiplying by the reciprocal is significantly faster than division in SIMD.
+    pub tail_reciprocal: f32,
+}
+
+/// Safely evaluates AVX-512 support and reconstructs elements in blocks of 16.
+pub fn decompress_blocks_avx512(
+    prefixes: &[u16],
+    tails: &[u16],
+    signs_mask: &[u64], // Bitmask where 1 = negative, 0 = positive (64 elements per u64)
+    out_weights: &mut [f32],
+    config: &SimdSplitConfig,
+) -> Option<()> {
+    // 1. Structural Boundaries Check (Safe Gatekeeper)
+    let n = prefixes.len();
+    if tails.len() < n || out_weights.len() < n {
+        return None;
+    }
+
+    // 2. Runtime Hardware Check
+    if is_x86_feature_detected!("avx512f") {
+        // Enclosing only the true hardware pointer actions in unsafe
+        unsafe {
+            decompress_blocks_avx512_impl(prefixes, tails, signs_mask, out_weights, config);
+        }
+        Some(())
+    } else {
+        None // Fallback to standard fallback iterator
+    }
+}
+
+/// Core AVX-512 Implementation Engine
+/// Safety: Must only be executed if the host CPU explicitly supports AVX-512F.
+#[target_feature(enable = "avx512f")]
+unsafe fn decompress_blocks_avx512_impl(
+    prefixes: &[u16],
+    tails: &[u16],
+    signs_mask: &[u64],
+    out_weights: &mut [f32],
+    config: &SimdSplitConfig,
+) {
+    let n = prefixes.len();
+    let simd_end = n - (n % 16); // Round down to multiple of 16
+
+    // Pre-load constants into 512-bit registers
+    let v_tail_recip = _mm512_set1_ps(config.tail_reciprocal);
+    let v_neg_one = _mm512_set1_ps(-1.0);
+    let v_pos_one = _mm512_set1_ps(1.0);
+
+    let mut i = 0;
+    while i < simd_end {
+        // 1. Load 16 elements of 16-bit integers
+        // Prefixes and tails are read directly from their memory boundaries
+        let raw_pref = unsafe { _mm256_loadu_si256(prefixes.as_ptr().add(i) as *const __m256i) };
+        let raw_tail = unsafe { _mm256_loadu_si256(tails.as_ptr().add(i) as *const __m256i) };
+
+        // 2. Convert 16-bit unsigned integers to 32-bit floating point inside ZMM registers
+        let v_pref = _mm512_cvtepu32_ps(_mm512_cvtepi16_epi32(raw_pref));
+        let v_tail = _mm512_cvtepu32_ps(_mm512_cvtepi16_epi32(raw_tail));
+
+        // 3. Fused Multiply-Add (FMA): (v_tail * v_tail_recip) + v_pref
+        // This calculates the absolute decimal value for 16 weights in 1 clock cycle.
+        let v_magnitude = _mm512_fmadd_ps(v_tail, v_tail_recip, v_pref);
+
+        // 4. Resolve Signs using AVX-512 Bitmask Operations
+        // Extract the correct 16-bit segment representing signs for these 16 elements
+        let global_bit_offset = i % 64;
+        let mask_word = unsafe {*signs_mask.get_unchecked(i / 64)};
+        let active_bits = ((mask_word >> global_bit_offset) & 0xFFFF) as u16;
+
+        // Convert the 16-bit scalar integer into an AVX-512 internal vector mask
+        let k_sign_mask = _mm512_int2mask(active_bits as i32);
+
+        // Blend -1.0 or 1.0 depending on the mask state
+        let v_sign = _mm512_mask_blend_ps(k_sign_mask, v_pos_one, v_neg_one);
+
+        // Apply signs: final_weight = magnitude * sign
+        let v_final = _mm512_mul_ps(v_magnitude, v_sign);
+
+        // 5. Stream results straight into target output memory
+        unsafe { _mm512_storeu_ps(out_weights.as_mut_ptr().add(i), v_final) };
+
+        i += 16;
+    }
+
+    // Scalar fallback loop for remaining elements (if data length is not a multiple of 16)
+    for idx in simd_end..n {
+        let p_val = prefixes[idx] as f32;
+        let t_val = tails[idx] as f32 * config.tail_reciprocal;
+        let mag = p_val + t_val;
+
+        let mask_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let is_neg = (signs_mask[mask_idx] & (1 << bit_idx)) != 0;
+        
+        out_weights[idx] = if is_neg { -mag } else { mag };
     }
 }

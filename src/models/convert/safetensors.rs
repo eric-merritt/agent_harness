@@ -11,7 +11,7 @@ use super::common::{
     CompressJob, CompressResult, ConversionStats, TensorStats,
     resolve_params,
 };
-use super::super::dedup::tensor::DedupCountTensor;
+use super::super::dedupe::tensor::DedupCountTensor;
 use super::super::formats::safetensors::{SafetensorsHeader, SafetensorsDtype};
 
 pub fn normalize_tensor_name(name: &str) -> String {

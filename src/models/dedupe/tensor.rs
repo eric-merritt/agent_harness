@@ -1,9 +1,9 @@
-use crate::models::dedup::types::UniqueTail;
+use crate::models::dedupe::types::UniqueTail;
 
 
 #[derive(Clone, Debug)]
 pub struct DedupCountTensor {
-    pub prefixes: Vec<u16>,      
+    pub prefixes: Vec<u8>,
     pub prefix_counts: Vec<u32>,
     pub unique_tails: Vec<UniqueTail>,
     pub count: usize,

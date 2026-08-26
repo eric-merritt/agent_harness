@@ -5,8 +5,8 @@
 //   Back:  tail counts (reversed), then prefix counts (reversed).
 // Flags separate the sections. One instance of each unique value — no repeats.
 
-use crate::models::dedup::tensor::DedupCountTensor;
-use crate::models::dedup::types::{DataFlag, UniqueTail};
+use crate::models::dedupe::tensor::DedupCountTensor;
+use crate::models::dedupe::types::{DataFlag, UniqueTail};
 
 /// Serialize the core dictionary using the bidirectional layout.
 pub fn serialize_core(tensor: &DedupCountTensor) -> Vec<u8> {
@@ -20,11 +20,11 @@ pub fn serialize_core(tensor: &DedupCountTensor) -> Vec<u8> {
     data.extend_from_slice(&(tensor.tail_digits as u32).to_le_bytes());
     data.extend_from_slice(&tensor.avg_precision_lost.to_le_bytes());
 
-    // Front: prefix values (u16 integers, one instance each)
+    // Front: prefix values (u8 each, stored as u32 for alignment)
     for &p in &tensor.prefixes {
-        data.extend_from_slice(&p.to_le_bytes());
+        data.extend_from_slice(&(p as u32).to_le_bytes());
     }
-    // Front: tail values (one instance each)
+    // Front: tail values (u32, one instance each)
     for ut in &tensor.unique_tails {
         data.extend_from_slice(&ut.value.to_le_bytes());
     }
@@ -62,17 +62,18 @@ pub fn deserialize_core_at(data: &[u8], pos: &mut usize) -> Option<DedupCountTen
 
     let mut prefixes = Vec::with_capacity(prefix_count);
     for _ in 0..prefix_count {
-        if data.len() < *pos + 2 { return None; }
-        prefixes.push(u16::from_le_bytes(data[*pos..*pos+2].try_into().ok()?));
-        *pos += 2;
+        if data.len() < *pos + 4 { return None; }
+        let val = u32::from_le_bytes(data[*pos..*pos+4].try_into().ok()?);
+        prefixes.push((val & 0xFF) as u8);
+        *pos += 4;
     }
 
     let mut unique_tails = Vec::with_capacity(tail_count);
     for _ in 0..tail_count {
-        if data.len() < *pos + 2 { return None; }
-        let value = u16::from_le_bytes(data[*pos..*pos+2].try_into().ok()?);
+        if data.len() < *pos + 4 { return None; }
+        let value = u32::from_le_bytes(data[*pos..*pos+4].try_into().ok()?);
         unique_tails.push(UniqueTail { value, repeat_count: 0 });
-        *pos += 2;
+        *pos += 4;
     }
 
     if *pos < data.len() && data[*pos] == DataFlag::GapFlag as u8 { *pos += 1; }

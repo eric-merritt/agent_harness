@@ -2,7 +2,8 @@
 //
 // Used by the GGUF, safetensors, and quantization conversion pipelines.
 
-use crate::models::dedup::tensor::DedupCountTensor;
+use crate::models::dedupe::tensor::DedupCountTensor;
+use crate::models::quantization::QuantizationLevels;
 pub use crate::models::avx512_kernel::avx512_preprocess_conversion_chunk;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,11 +56,18 @@ pub const HIGH_PRECISION_TRUNCATE_ROUNDS: usize = 0;
 pub const CHUNK_SIZE: usize = 1_000_000;
 pub const GPU_MIN_ELEMENTS: usize = 100_000;
 
+/// Resolve quantization level and params from a tensor name.
+pub fn resolve_quantization(name: &str) -> QuantizationLevels {
+    QuantizationLevels::from_name(name)
+}
+
 pub fn resolve_params(name: &str, prefix_digits: usize, truncate_rounds: usize) -> (usize, usize) {
-    if HIGH_PRECISION_TENSORS.contains(&name) {
-        (prefix_digits + HIGH_PRECISION_EXTRA_DIGITS, HIGH_PRECISION_TRUNCATE_ROUNDS)
-    } else {
-        (prefix_digits, truncate_rounds)
+    let level = resolve_quantization(name);
+    match level {
+        QuantizationLevels::FullPrecision => (0, 0),
+        QuantizationLevels::HalfPrecision => (prefix_digits + 2, 0),
+        QuantizationLevels::ToNeg4 => (prefix_digits, truncate_rounds),
+        QuantizationLevels::ToNeg8 => (prefix_digits, truncate_rounds),
     }
 }
 

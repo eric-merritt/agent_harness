@@ -8,7 +8,7 @@ use memmap2::Mmap;
 use crate::models::avx512_kernel::*;
 use super::common::{ConversionStats, TensorStats};
 use super::core::*;
-use crate::models::dedup::types::Sandbag;
+use crate::models::dedupe::types::Sandbag;
 use crate::memory_controller::virtual_tensor_arena::{VirtualTensorArena, PageResidency};
 
 pub struct ModelLoader {
@@ -116,7 +116,7 @@ pub struct ChunkInfo {
     core_pos: usize,
     sand_pos: usize,
     element_count: usize,
-    remap: Option<crate::models::dedup::types::ChunkRemap>,
+    remap: Option<crate::models::dedupe::types::ChunkRemap>,
 }
 
 
@@ -126,16 +126,16 @@ impl ModelLoader {
         self.decompress_tensor_impl(name, None, true)
     }
 
-    pub fn decompress_tensor_global(&self, name: &str, global: Arc<crate::models::dedup::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    pub fn decompress_tensor_global(&self, name: &str, global: Arc<crate::models::dedupe::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.decompress_tensor_impl(name, Some(global), true)
     }
 
-    pub fn decompress_tensor_global_single(&self, name: &str, global: Arc<crate::models::dedup::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    pub fn decompress_tensor_global_single(&self, name: &str, global: Arc<crate::models::dedupe::types::GlobalTable>) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         self.decompress_tensor_impl(name, Some(global), false)
     }
 
         fn decompress_tensor_impl(
-        &self, name: &str, global: Option<Arc<crate::models::dedup::types::GlobalTable>>, parallel_chunks: bool,
+        &self, name: &str, global: Option<Arc<crate::models::dedupe::types::GlobalTable>>, parallel_chunks: bool,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let idx = *self.tensor_index.get(name).ok_or_else(|| format!("tensor not found: {}", name))?;
         let is_full_precision = self.manifest.tensors[idx].full_precision;
@@ -175,7 +175,7 @@ impl ModelLoader {
             let chunk_sand_pos = sand_pos;
             let tensor = match deserialize_core_at(core_buf, &mut core_pos) { Some(t) => t, None => break };
             let chunk_sand = match Sandbag::from_bytes(&sandbag_buf[sand_pos..]) { Some(s) => s, None => break };
-            sand_pos += chunk_sand.bytes();
+            sand_pos += chunk_sand.estimated_size();
             let remap = global.as_ref().map(|gt| gt.build_chunk_remap(&tensor));
             chunks.push(ChunkInfo { core_pos: chunk_core_pos, sand_pos: chunk_sand_pos, element_count: tensor.count, remap });
         }

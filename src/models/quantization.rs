@@ -16,6 +16,58 @@
 use std::collections::HashMap;
 use std::arch::x86_64::*;
 
+/// Quantization granularity levels for different tensor types.
+///
+/// Tensors critical to inference quality (norms, embeddings, output head)
+/// should use higher precision; large weight matrices can use aggressive compression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizationLevels {
+    /// Store at full f32 precision — no quantization.
+    FullPrecision,
+    /// Store at f16 (half precision).
+    HalfPrecision,
+    /// Quantize to ~10⁻⁴ absolute precision.
+    ToNeg4,
+    /// Quantize to ~10⁻⁸ absolute precision.
+    ToNeg8,
+}
+
+impl QuantizationLevels {
+    /// Determine quantization level from a tensor name.
+    ///
+    /// Rules (checked in order — first match wins):
+    /// - norm / layernorm / rms_norm / post_norm → FullPrecision
+    /// - embed / vocab / head / .gate. / output.weight → HalfPrecision
+    /// - attn_output / out_proj → ToNeg4
+    /// - everything else → ToNeg8
+    pub fn from_name(name: &str) -> Self {
+        let lower = name.to_lowercase();
+
+        // Norm weights — small scaling vectors, error propagates everywhere
+        if lower.contains("norm") {
+            return Self::FullPrecision;
+        }
+
+        // Embeddings, vocab, head, gate, output — error enters every forward pass or final logits
+        if lower.contains("embed")
+            || lower.contains("vocab")
+            || lower.contains("head")
+            || lower.contains(".gate.")
+            || lower == "output.weight"
+        {
+            return Self::HalfPrecision;
+        }
+
+        // Attention output projections — quality-sensitive but compressible
+        if lower.contains("attn_output") || lower.contains("out_proj") {
+            return Self::ToNeg4;
+        }
+
+        // Default: large FFN / expert / vision weight matrices
+        Self::ToNeg8
+    }
+}
+
 
 pub trait QuantMethod {
     fn compress(&self, weights: &[f32]) -> CompressedTensor;
@@ -333,7 +385,7 @@ pub struct WorkerChunk {
 }
 
 pub fn split_for_workers(compressed: &CompressedTensor, num_workers: usize) -> Vec<WorkerChunk> {
-    let num_workers = num_workers.max(1);
+    let num_workers = num_workers.max(16);
     let total_elements = compressed.original_count;
     let chunk_size = (total_elements + num_workers - 1) / num_workers;
 

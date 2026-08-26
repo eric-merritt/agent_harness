@@ -50,6 +50,7 @@ smallvec = "1"
 criterion = "0.5"
 hashbrown = "0.17.1"
 derive_more = { version = "2.1.1", features = [ "into" ] }
+rayon = "1.12.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -80,4 +81,8 @@ harness = false
 
 [[bench]]
 name = "compress_bench"
+harness = false
+
+[[bench]]
+name = "decompress_bench"
 harness = false

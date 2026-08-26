@@ -26,21 +26,30 @@ struct Push {
 @group(0) @binding(2) var<storage, read_write> tails: array<u32>;
 @group(0) @binding(3) var<storage, read_write> signs: array<u32>;
 @group(0) @binding(4) var<uniform> push: Push;
+@group(0) @binding(5) var<storage, read_write> prefix_ints: array<u32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x + gid.y * push.stride;
     if (idx >= push.element_count) { return; }
-    
+
     let w = input[idx];
     let abs_w = abs(w);
     let prefix_scale = pow(10.0, f32(push.prefix_digits));
-    let prefix = floor(abs_w * prefix_scale) / prefix_scale;
+    // Must match the AVX-512 path exactly:
+    //   v_prefix_int = floor(abs_w * prefix_scale)          (round-to-neg-inf)
+    //   v_prefix_val = v_prefix_int / prefix_scale          (f32 div of the int)
+    //   v_tail_val   = abs_w - v_prefix_val
+    //   tail_int     = round(v_tail_val * 10^7)
+    let p_int = u32(floor(abs_w * prefix_scale));
+    // Match AVX-512 path exactly: prefix_val = f32(floor(abs_w * prefix_scale)) / prefix_scale
+    let prefix = f32(p_int) / prefix_scale;
     let tail_val = abs_w - prefix;
     let tail_scale = pow(10.0, 7.0);
     let tail_int = u32(round(tail_val * tail_scale));
-    
+
     prefix_bits[idx] = bitcast<u32>(prefix);
+    prefix_ints[idx] = p_int;
     tails[idx] = tail_int;
     signs[idx] = select(0u, 1u, w < 0.0);
 }
@@ -84,6 +93,9 @@ pub struct GpuOutput {
     pub prefix_bits: Vec<u32>,
     pub tails: Vec<u32>,
     pub signs: Vec<u32>,
+    /// Integer prefix values: floor(abs(w) * 10^prefix_digits) — exact,
+    /// no float round-trip. Lets the pure-GPU CPU dedup path skip weights.
+    pub prefix_ints: Vec<u32>,
 }
 
 fn init_gpu() -> Option<Arc<GpuContext>> {
@@ -124,6 +136,9 @@ fn init_gpu() -> Option<Arc<GpuContext>> {
                     has_dynamic_offset: false, min_binding_size: None }, count: None },
             wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None }, count: None },
+            wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false, min_binding_size: None }, count: None },
         ],
     });
@@ -201,8 +216,8 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
     if n == 0 { return None; }
 
     let byte_size = (n * 4) as u64;
-    // 7 buffers: input, prefix, tail, sign, prefix_read, tail_read, sign_read
-    let job_mem = byte_size * 7;
+    // 8 buffers: input, prefix, tail, sign, prefix_int + 4 readback buffers
+    let job_mem = byte_size * 8;
     let prev = GPU_MEM_USED.fetch_add(job_mem, Ordering::Relaxed);
     let new_total = prev + job_mem;
     let cap = GPU_MEM_CAPACITY.load(Ordering::Relaxed);
@@ -236,6 +251,10 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
         label: Some("Signs"),
         size: byte_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
     });
+    let pint_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Prefix Ints"),
+        size: byte_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+    });
 
     let total_groups = ((n + 255) / 256) as u32;
     let gx = total_groups.min(65535);
@@ -260,6 +279,10 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
         label: Some("Sign Read"),
         size: byte_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
+    let pint_read = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Prefix Int Read"),
+        size: byte_size, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
 
     let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Compression Bind Group"),
@@ -270,6 +293,7 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
             wgpu::BindGroupEntry { binding: 2, resource: tail_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: sign_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: uniform_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: pint_buf.as_entire_binding() },
         ],
     });
 
@@ -292,6 +316,7 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
     encoder.copy_buffer_to_buffer(&prefix_buf, 0, &prefix_read, 0, byte_size);
     encoder.copy_buffer_to_buffer(&tail_buf, 0, &tail_read, 0, byte_size);
     encoder.copy_buffer_to_buffer(&sign_buf, 0, &sign_read, 0, byte_size);
+    encoder.copy_buffer_to_buffer(&pint_buf, 0, &pint_read, 0, byte_size);
 
     let submission = gpu.queue.submit([encoder.finish()]);
     gpu.device.poll(wgpu::Maintain::wait_for(submission));
@@ -299,18 +324,21 @@ pub fn gpu_compute(weights: &[f32], prefix_digits: usize) -> Option<GpuOutput> {
     let prefix_bits = read_buffer(&gpu.device, &prefix_read, n);
     let tails = read_buffer(&gpu.device, &tail_read, n);
     let signs = read_buffer(&gpu.device, &sign_read, n);
+    let prefix_ints = read_buffer(&gpu.device, &pint_read, n);
 
     input_buf.destroy();
     prefix_buf.destroy();
     tail_buf.destroy();
     sign_buf.destroy();
+    pint_buf.destroy();
     uniform_buf.destroy();
     prefix_read.destroy();
     tail_read.destroy();
     sign_read.destroy();
+    pint_read.destroy();
 
     // MemGuard drops here: decrements GPU_MEM_USED, re-enables GPU_READY if VRAM recovered
-    Some(GpuOutput { prefix_bits, tails, signs })
+    Some(GpuOutput { prefix_bits, tails, signs, prefix_ints })
 }
 
 fn read_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
@@ -398,7 +426,7 @@ pub struct GpuDictionary {
 impl GpuDictionary {
     /// Create from a GlobalTable's CSR layout. Initializes GPU if needed.
     /// Returns None if no GPU is available.
-    pub fn create_from_global_table(gt: &crate::models::dedup::types::GlobalTable) -> Option<Self> {
+    pub fn create_from_global_table(gt: &crate::models::dedupe::types::GlobalTable) -> Option<Self> {
         let gpu = GPU.get_or_init(init_gpu).as_ref()?;
         // Flatten per-prefix tail vectors into CSR (flat tails + offsets)
         let mut tail_offsets: Vec<u32> = Vec::with_capacity(gt.tails_for_prefix.len() + 1);

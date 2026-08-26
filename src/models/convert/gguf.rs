@@ -14,7 +14,7 @@ use super::common::{
     CompressJob, CompressResult, CHUNK_SIZE, resolve_params
 };
 
-use super::super::dedup::tensor::DedupCountTensor;
+use super::super::dedupe::tensor::DedupCountTensor;
 
 use super::super::formats::gguf::{GGUFFile, quant_block_info};
 

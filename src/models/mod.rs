@@ -1,6 +1,6 @@
 pub mod adapters;
 pub mod convert;
-pub mod dedup;
+pub mod dedupe;
 pub mod formats;
 pub mod indexed;
 pub mod packed;

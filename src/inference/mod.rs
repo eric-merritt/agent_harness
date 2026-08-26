@@ -28,8 +28,8 @@ use std::fs::File;
 
 use crate::models::convert::loader::{ModelLoader};
 use crate::models::convert::core::deserialize_core_chunks;
-use crate::models::dedup::types::GlobalTable;
-use crate::models::dedup::tensor::DedupCountTensor;
+use crate::models::dedupe::types::GlobalTable;
+use crate::models::dedupe::tensor::DedupCountTensor;
 use config::ModelConfig;
 use tokenizer::Tokenizer;
 
