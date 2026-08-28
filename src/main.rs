@@ -1,12 +1,11 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use agent_harness::*;
-use std::path::Path;
-use std::io::Write;
 use crate::inference::KvCache;
+use agent_harness::*;
 use std::env;
-
+use std::io::Write;
+use std::path::Path;
 
 /// File wrapper that auto-flushes after every write — env_logger's Target::Pipe
 /// uses buffered File by default, which delays log visibility until the buffer fills.
@@ -37,15 +36,25 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|e| {
             // Fallback to stderr if file can't be opened
             eprintln!("Failed to open log file, falling back to stderr: {}", e);
-            std::fs::OpenOptions::new().create(true).append(true).open("/dev/stderr").unwrap()
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/dev/stderr")
+                .unwrap()
         });
 
-    unsafe { env::set_var("DATABASE_URL", "postgres://ermer:ermer@localhost/agent_harness") };
+    unsafe {
+        env::set_var(
+            "DATABASE_URL",
+            "postgres://ermer:ermer@localhost/agent_harness",
+        )
+    };
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"))
-        .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(AutoFlushFile(log_file))))
-        .init();
+        env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"),
+    )
+    .format_timestamp_millis()
+    .target(env_logger::Target::Pipe(Box::new(AutoFlushFile(log_file))))
+    .init();
 
     // Redirect panic messages to the log file too — otherwise they go to
     // stderr and corrupt the TUI alt screen.

@@ -37,7 +37,11 @@ fn main() {
     println!("  Core size:     {} bytes", core.len());
     println!("  Sandbag size:  {} bytes", sandbag_bytes.len());
     println!("  Total:         {} bytes", total_compressed);
-    println!("  Ratio:         {:.1}% of original ({:.2}x compression)", ratio, (n * 4) as f64 / total_compressed as f64);
+    println!(
+        "  Ratio:         {:.1}% of original ({:.2}x compression)",
+        ratio,
+        (n * 4) as f64 / total_compressed as f64
+    );
     println!("  Prefixes:      {}", tensor.prefixes.len());
     println!("  Unique tails:  {}", tensor.unique_tails.len());
     println!("  Avg precision lost: {:.2e}", tensor.avg_precision_lost);
@@ -65,18 +69,32 @@ fn main() {
     // Outliers are restored at full precision, so they shouldn't count toward error
     for &(pos, _) in &sandbag.outliers {
         let err = (weights[pos] - decompressed[pos]).abs();
-        assert!(err < 1e-6, "Outlier at {} not restored: orig={}, decomp={}", pos, weights[pos], decompressed[pos]);
+        assert!(
+            err < 1e-6,
+            "Outlier at {} not restored: orig={}, decomp={}",
+            pos,
+            weights[pos],
+            decompressed[pos]
+        );
     }
 
     let rmse = (mse_sum / n as f64).sqrt();
-    println!("  Max error:     {:.2e} (at index {})", max_err, max_err_idx);
+    println!(
+        "  Max error:     {:.2e} (at index {})",
+        max_err, max_err_idx
+    );
     println!("  RMSE:          {:.2e}", rmse);
     println!("  Outliers:      {}", outlier_count);
     println!("  Unique values: {}", sandbag.unique_values.len());
     println!("  Scale:          {:.2e}", sandbag.scale);
 
     // Sanity checks
-    assert!(total_compressed < n * 4, "FAIL: Compressed {} >= original {}", total_compressed, n * 4);
+    assert!(
+        total_compressed < n * 4,
+        "FAIL: Compressed {} >= original {}",
+        total_compressed,
+        n * 4
+    );
     assert!(rmse < 0.01, "FAIL: RMSE {:.2e} too high", rmse);
 
     println!("\n=== PASS: Compression works correctly ===");

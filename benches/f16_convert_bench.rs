@@ -1,10 +1,9 @@
 // benches/f16_convert_bench.rs
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use agent_harness::models::avx512_kernel::{
-    avx512_bf16_to_f32, avx512_f16_to_f32,
-    bf16_to_f32_scalar, dispatch_bf16_bytes_to_f32, dispatch_f16_bytes_to_f32,
-    f16_to_f32_scalar,
+    avx512_bf16_to_f32, avx512_f16_to_f32, bf16_to_f32_scalar, dispatch_bf16_bytes_to_f32,
+    dispatch_f16_bytes_to_f32, f16_to_f32_scalar,
 };
 
 /// Deterministic pseudo-random byte buffer (LCG, no rand crate needed).
@@ -69,7 +68,9 @@ fn bench_f16(c: &mut Criterion) {
         group.bench_function("avx512_kernel_only", |b| {
             b.iter(|| {
                 let mut out = vec![0f32; n_elems];
-                unsafe { avx512_f16_to_f32(&src, &mut out); }
+                unsafe {
+                    avx512_f16_to_f32(&src, &mut out);
+                }
                 criterion::black_box(&out);
             });
         });
@@ -103,7 +104,9 @@ fn bench_bf16(c: &mut Criterion) {
         group.bench_function("avx512_kernel_only", |b| {
             b.iter(|| {
                 let mut out = vec![0f32; n_elems];
-                unsafe { avx512_bf16_to_f32(&src, &mut out); }
+                unsafe {
+                    avx512_bf16_to_f32(&src, &mut out);
+                }
                 criterion::black_box(&out);
             });
         });
