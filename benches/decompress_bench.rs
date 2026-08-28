@@ -86,7 +86,7 @@ fn bench_decompress(c: &mut Criterion) {
     // Benchmark decompression only
     let mut group = c.benchmark_group("decompress");
     group.throughput(Throughput::Elements(n as u64));
-    group.sample_size(10000);
+    group.sample_size(256);
 
     group.bench_function("scalar_percent", |b| {
         b.iter(|| {

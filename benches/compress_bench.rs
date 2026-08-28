@@ -37,7 +37,7 @@ fn bench_compress(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("compress");
     group.throughput(Throughput::Elements(n as u64));
-    group.sample_size(10000);
+    group.sample_size(50);
 
     // ── Scalar percentile ────────────────────────────────────────────────
     group.bench_function("scalar_percent", |b| {

@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use agent_harness::*;
 use std::path::Path;
 use std::io::Write;

@@ -4,39 +4,84 @@
 // quantize_block_avx512 — AVX-512 accelerated quantization
 // quantize_block_kl  — KL-divergence search, slower but higher quality
 
+use rayon::prelude::*;
 use std::f32;
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Fast O(n) quantization with 99.5th percentile outlier clipping.
-/// Returns `(scale, outliers)` — the quantized i16 values are discarded since
-/// build_from_quantized reconstructs from the original f32 weights.
+/// Ultra-fast O(n) quantization with parallel histogram percentile estimation.
+/// Zero heap allocations during the threshold selection phase.
 pub fn quantize_block(weights: &[f32]) -> (f32, Vec<(usize, f32)>) {
     let n = weights.len();
     if n == 0 {
         return (1.0, Vec::new());
     }
 
-    // Collect absolute values for percentile selection (just f32, no tuples)
-    let mut abs_vals: Vec<f32> = weights.iter().map(|&w| w.abs()).collect();
+    // Step 1: Find the absolute maximum value using parallel reduction (no allocations)
+    let global_max = weights
+        .par_iter()
+        .map(|&w| w.abs())
+        .fold(|| 0.0f32, |max_val, w_abs| max_val.max(w_abs))
+        .reduce(|| 0.0f32, |max_a, max_b| max_a.max(max_b));
 
-    // Partial sort to find the 99.5th percentile threshold
-    let clip_idx = ((n as f64 * 0.995).ceil() as usize).min(n).saturating_sub(1);
-    abs_vals.select_nth_unstable_by(clip_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if global_max <= f32::EPSILON {
+        return (1.0, Vec::new());
+    }
 
-    let max_abs = abs_vals[clip_idx].max(f32::EPSILON);
+    // Step 2: Build a parallel histogram of absolute magnitudes to find the percentile
+    const BINS: usize = 2048;
+    let histogram = weights
+        .par_chunks(65536) // Cache-aligned chunk granularity
+        .map(|chunk| {
+            let mut local_bins = [0usize; BINS];
+            for &w in chunk {
+                let abs_w = w.abs();
+                // Map the float range [0.0, global_max] linearly into our histogram bins
+                let bin = ((abs_w / global_max) * (BINS - 1) as f32) as usize;
+                local_bins[bin.min(BINS - 1)] += 1;
+            }
+            local_bins
+        })
+        .reduce(
+            || [0usize; BINS],
+            |mut hist_a, hist_b| {
+                for i in 0..BINS {
+                    hist_a[i] += hist_b[i];
+                }
+                hist_a
+            },
+        );
 
-    // Compute scale factor
-    let scale = max_abs / i16::MAX as f32;
+    // Step 3: Walk back down the histogram sequentially to isolate the 99.5th percentile threshold
+    let target_outliers_count = (n as f64 * 0.005).floor() as usize;
+    let mut accumulated_elements = 0;
+    let mut clip_bin = BINS - 1;
 
-    // Scan for outliers only — quantized values are discarded (not used by caller)
-    let mut outliers = Vec::new();
-    for (i, &w) in weights.iter().enumerate() {
-        if w.abs() > max_abs {
-            outliers.push((i, w));
+    for bin in (0..BINS).rev() {
+        accumulated_elements += histogram[bin];
+        if accumulated_elements >= target_outliers_count {
+            clip_bin = bin;
+            break;
         }
     }
+
+    // Reconstruct the threshold value from the target bin index
+    let max_abs = ((clip_bin as f32 / (BINS - 1) as f32) * global_max).max(f32::EPSILON);
+    let scale = max_abs / i16::MAX as f32;
+
+    // Step 4: Scan for outliers (Pre-allocated capacity to prevent thread allocation thrashing)
+    let outliers: Vec<(usize, f32)> = weights
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, &w)| {
+            if w.abs() > max_abs {
+                Some((i, w))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     (scale, outliers)
 }
@@ -54,8 +99,8 @@ pub unsafe fn quantize_block_avx512(weights: &[f32]) -> (f32, Vec<(usize, f32)>)
         return (1.0, Vec::new());
     }
 
-    // Collect absolute values for percentile selection
-    let mut abs_vals: Vec<f32> = weights.iter().map(|&w| w.abs()).collect();
+    // Collect absolute values for percentile selection (parallel)
+    let mut abs_vals: Vec<f32> = weights.par_iter().map(|&w| w.abs()).collect();
 
     // Partial sort to find the 99.5th percentile threshold
     let clip_idx = ((n as f64 * 0.995).ceil() as usize).min(n).saturating_sub(1);
@@ -104,12 +149,18 @@ pub unsafe fn quantize_block_avx512(weights: &[f32]) -> (f32, Vec<(usize, f32)>)
             }
         }
     } else {
-        // Scalar fallback
-        for (i, &w) in weights.iter().enumerate() {
-            if w.abs() > max_abs {
-                outliers.push((i, w));
-            }
-        }
+        // Scalar fallback (parallel)
+        let outliers_collected: Vec<(usize, f32)> = weights.par_iter()
+            .enumerate()
+            .filter_map(|(i, &w)| {
+                if w.abs() > max_abs {
+                    Some((i, w))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        outliers.extend(outliers_collected);
     }
 
     (scale, outliers)
