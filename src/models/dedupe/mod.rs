@@ -1,9 +1,9 @@
-pub mod types;
-pub mod tensor;
 pub mod compressor;
+pub mod tensor;
 pub mod truncation;
+pub mod types;
 pub use super::avx512_kernel;
-pub mod serialization;
 pub mod decompressor;
 pub mod global_lookup;
 pub mod gpu_helpers;
+pub mod serialization;

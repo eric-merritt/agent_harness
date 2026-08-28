@@ -1,3 +1,3 @@
 pub mod gguf;
-pub mod safetensors;
 pub mod pt;
+pub mod safetensors;

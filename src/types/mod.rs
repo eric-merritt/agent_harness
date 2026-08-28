@@ -1,4 +1,4 @@
-pub mod tensor;
-pub mod shape;
-pub mod dtype;
 pub mod buffer;
+pub mod dtype;
+pub mod shape;
+pub mod tensor;
