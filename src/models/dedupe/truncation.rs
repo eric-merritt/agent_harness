@@ -184,8 +184,8 @@ pub fn quantize_block_kl(weights: &[f32]) -> (f32, Vec<(usize, f32)>) {
 		return (1.0, Vec::new());
 	}
 
-	// Find the range of absolute values
-	let mut abs_vals: Vec<f32> = weights.iter().map(|&w| w.abs()).collect();
+	// Find the range of absolute values (parallel)
+	let mut abs_vals: Vec<f32> = weights.par_iter().map(|&w| w.abs()).collect();
 	abs_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
 	let max_abs = abs_vals
@@ -214,19 +214,33 @@ pub fn quantize_block_kl(weights: &[f32]) -> (f32, Vec<(usize, f32)>) {
 		// Reset histogram for this iteration
 		quant_hist.fill(0.0);
 
-		// Build quantized distribution
+		// Build quantized distribution (parallel reduce into histogram)
 		let range = 2.0 * max_abs;
-		for &w in weights {
-			let clamped = w.clamp(-clip_val, clip_val);
-			let q = (clamped / scale)
-				.round()
-				.clamp(i16::MIN as f32, i16::MAX as f32);
-			let recon = q as f32 * scale;
-			let mut bin = (((recon - (-max_abs)) / range) * 2048.0) as usize;
-			if bin >= 2048 {
-				bin = 2047;
+		let local_hists: Vec<[f32; 2048]> = weights
+			.par_chunks(65536)
+			.map(|chunk| {
+				let mut local = [0.0f32; 2048];
+				for &w in chunk {
+					let clamped = w.clamp(-clip_val, clip_val);
+					let q = (clamped / scale)
+						.round()
+						.clamp(i16::MIN as f32, i16::MAX as f32);
+					let recon = q as f32 * scale;
+					let mut bin = (((recon - (-max_abs)) / range) * 2048.0) as usize;
+					if bin >= 2048 {
+						bin = 2047;
+					}
+					local[bin] += 1.0;
+				}
+				local
+			})
+			.collect();
+
+		// Merge local histograms
+		for local in &local_hists {
+			for i in 0..2048 {
+				quant_hist[i] += local[i];
 			}
-			quant_hist[bin] += 1.0;
 		}
 		let sum: f32 = quant_hist.iter().sum();
 		if sum > 0.0 {
@@ -244,19 +258,24 @@ pub fn quantize_block_kl(weights: &[f32]) -> (f32, Vec<(usize, f32)>) {
 	let scale = max_abs / i16::MAX as f32;
 
 	// Scan for outliers only — quantized values are discarded (not used by caller)
-	let mut outliers = Vec::new();
-	for (i, &w) in weights.iter().enumerate() {
-		if w.abs() > max_abs {
-			outliers.push((i, w));
-		}
-	}
+	let outliers: Vec<(usize, f32)> = weights
+		.par_iter()
+		.enumerate()
+		.filter_map(|(i, &w)| {
+			if w.abs() > max_abs {
+				Some((i, w))
+			} else {
+				None
+			}
+		})
+		.collect();
 
 	(scale, outliers)
 }
 
 fn kl_divergence(p: &[f32], q: &[f32]) -> f32 {
-	p.iter()
-		.zip(q.iter())
+	p.par_iter()
+		.zip(q.par_iter())
 		.map(|(&p_i, &q_i)| {
 			if p_i == 0.0 {
 				0.0
@@ -266,23 +285,38 @@ fn kl_divergence(p: &[f32], q: &[f32]) -> f32 {
 				p_i * (p_i / q_i).ln()
 			}
 		})
-		.sum()
+		.reduce(|| 0.0f32, |a, b| a + b)
 }
 
 fn build_histogram(weights: &[f32], min_val: f32, max_val: f32, bins: usize) -> Vec<f32> {
-	let mut hist = vec![0.0; bins];
 	let range = max_val - min_val;
 	if range == 0.0 {
-		return hist;
+		return vec![0.0; bins];
 	}
 
-	for &w in weights {
-		let clamped = w.clamp(min_val, max_val);
-		let mut bin = (((clamped - min_val) / range) * bins as f32) as usize;
-		if bin >= bins {
-			bin = bins - 1;
+	// Parallel reduce into histogram
+	let local_hists: Vec<Vec<f32>> = weights
+		.par_chunks(65536)
+		.map(|chunk| {
+			let mut local = vec![0.0f32; bins];
+			for &w in chunk {
+				let clamped = w.clamp(min_val, max_val);
+				let mut bin = (((clamped - min_val) / range) * bins as f32) as usize;
+				if bin >= bins {
+					bin = bins - 1;
+				}
+				local[bin] += 1.0;
+			}
+			local
+		})
+		.collect();
+
+	// Merge
+	let mut hist = vec![0.0f32; bins];
+	for local in &local_hists {
+		for i in 0..bins {
+			hist[i] += local[i];
 		}
-		hist[bin] += 1.0;
 	}
 
 	let sum: f32 = hist.iter().sum();
