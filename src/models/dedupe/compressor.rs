@@ -1,9 +1,11 @@
-use crate::models::convert::common::{CHUNK_SIZE, CompressJob, CompressOutput};
-use crate::models::convert::core::{deserialize_core, serialize_core};
+use crate::models::convert::common::{CHUNK_SIZE, CompressOutput};
+use crate::models::convert::core::{serialize_core};
 use crate::models::dedupe::tensor::DedupCountTensor;
 use crate::models::dedupe::truncation::{quantize_block, quantize_block_avx512, quantize_block_kl};
 use crate::models::dedupe::types::Sandbag;
 use crate::models::quantization::QuantizationLevels;
+use crate::memory_controller::gpu_mem_op::{GpuMemory, GpuQuantizeOutput};
+
 use hashbrown::HashMap as AHashMap;
 
 /// Convert f32 to IEEE 754 binary16 (half precision).
@@ -78,6 +80,13 @@ impl DedupCountTensor {
 			quantize_block(weights)
 		};
 		Self::build_from_quantized(weights, scale, outliers, prefix_digits, _truncate_rounds)
+	}
+
+	/// GPU shader-based quantization — returns prefix_ints, tails, signs for dedup.
+	/// Returns None if GPU is unavailable.
+	fn gpu_quantize(weights: &[f32], prefix_digits: usize) -> Option<GpuQuantizeOutput> {
+		let gpu = GpuMemory::new();
+		unsafe { gpu.gpu_quantize(weights, prefix_digits) }
 	}
 
 	/// Build DedupCountTensor + Sandbag from original f32 weights using prefix/tail split.
@@ -281,15 +290,14 @@ impl DedupCountTensor {
 	}
 
 	/// GPU prefix chopping + AVX-512 tail processing — percentile clip.
-	/// Calls gpu_compute() for GPU prefix/tail/sign extraction, then uses
-	/// AVX-512 for weight reconstruction before quantization.
+	/// Uses GPU shader for quantization, falls back to scalar if GPU unavailable.
 	pub fn compress_gpu_with_avx512_percent(
 		weights: &[f32],
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
 		// Try GPU path first
-		if let Some(gpu_out) = crate::gpu::gpu_compute(weights, prefix_digits) {
+		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
 			return Self::compress_from_gpu_percent(
 				&gpu_out.prefix_ints,
 				&gpu_out.tails,
@@ -303,13 +311,13 @@ impl DedupCountTensor {
 	}
 
 	/// GPU prefix chopping + scalar tail processing — percentile clip.
-	/// Same as gpu_with_avx512 but forces scalar reconstruction path.
+	/// Uses GPU shader for quantization, forces scalar reconstruction path.
 	pub fn compress_gpu_with_scalar_tails_percent(
 		weights: &[f32],
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = crate::gpu::gpu_compute(weights, prefix_digits) {
+		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
 			// Force scalar reconstruction (no AVX-512)
 			let n = gpu_out.prefix_ints.len();
 			let prefix_scale = 10f32.powi(prefix_digits as i32);
@@ -445,7 +453,7 @@ impl DedupCountTensor {
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = crate::gpu::gpu_compute(weights, prefix_digits) {
+		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
 			return Self::compress_from_gpu_kl(
 				&gpu_out.prefix_ints,
 				&gpu_out.tails,
@@ -458,13 +466,13 @@ impl DedupCountTensor {
 	}
 
 	/// GPU + scalar tails — KL divergence quantization.
-	/// Forces scalar reconstruction path (no AVX-512).
+	/// Uses GPU shader, forces scalar reconstruction path (no AVX-512).
 	pub fn compress_gpu_with_scalar_tails_kl(
 		weights: &[f32],
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = crate::gpu::gpu_compute(weights, prefix_digits) {
+		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
 			let n = gpu_out.prefix_ints.len();
 			let prefix_scale = 10f32.powi(prefix_digits as i32);
 			let weights: Vec<f32> = (0..n)

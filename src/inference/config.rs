@@ -39,7 +39,7 @@ pub struct ModelConfig {
 	pub ssm_n_group: usize,
 	#[serde(default)]
 	pub full_attn_interval: usize,
-	#[serde(default, alias = "max_position_embeddings")]
+	#[serde(default)]
 	pub context_length: usize,
 	#[serde(default)]
 	pub vocab_size: usize,

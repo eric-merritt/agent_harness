@@ -86,7 +86,9 @@ fn bench_compress(c: &mut Criterion) {
 	});
 
 	// GPU pre-compute (shared by all GPU paths) — ONCE before all GPU benchmarks
-	let gpu_out = agent_harness::gpu::gpu_compute(&weights, prefix_digits);
+	// Uses the new GPU shader-based quantization via memory_controller
+	// Wrapped in a catch-unwind + signal handler to avoid crashing the benchmark
+	let gpu_out = agent_harness::memory_controller::gpu_mem_op::try_gpu_quantize(&weights, prefix_digits);
 
 	if let Some(gpu_out) = &gpu_out {
 		let prefix_ints = gpu_out.prefix_ints.clone();

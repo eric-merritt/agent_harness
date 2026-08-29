@@ -84,8 +84,8 @@ fn bench_decompress(c: &mut Criterion) {
 		eprintln!("  {name:24} roundtrip_mse = {:.2e}", err);
 	}
 
-	// GPU pre-compute
-	let gpu_out = agent_harness::gpu::gpu_compute(&weights, prefix_digits);
+	// GPU pre-compute (uses new shader-based quantization)
+	let gpu_out = agent_harness::memory_controller::gpu_mem_op::try_gpu_quantize(&weights, prefix_digits);
 	if let Some(gpu_out) = &gpu_out {
 		let (tensor_gp, sandbag_gp) = DedupCountTensor::compress_from_gpu_percent(
 			&gpu_out.prefix_ints,

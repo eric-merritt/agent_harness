@@ -647,3 +647,20 @@ impl Drop for GpuMemory {
 		}
 	}
 }
+
+/// Result of GPU quantization: prefix_ints, tails, signs ready for dedup.
+pub struct GpuQuantizeOutput {
+	pub prefix_ints: Vec<u32>,
+	pub tails: Vec<u32>,
+	pub signs: Vec<u32>,
+}
+
+/// Try GPU quantization; returns None if GPU init fails (no crash).
+pub fn try_gpu_quantize(weights: &[f32], prefix_digits: usize) -> Option<GpuQuantizeOutput> {
+	std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+		let gpu = GpuMemory::new();
+		unsafe { gpu.gpu_quantize(weights, prefix_digits) }
+	}))
+	.ok()
+	.flatten()
+}
