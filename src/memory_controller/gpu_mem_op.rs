@@ -636,6 +636,295 @@ impl GpuMemory {
 
 		result
 	}
+
+	/// Run the quantize_gemv shader on weights.
+	/// Uploads weights, dispatches the shader, downloads prefix/tail/sign outputs.
+	/// Returns GpuQuantizeOutput ready for dedup compression.
+	pub unsafe fn gpu_quantize(
+		&self,
+		weights: &[f32],
+		_prefix_digits: usize,
+	) -> Option<GpuQuantizeOutput> {
+		use std::cmp;
+
+		let n = weights.len();
+		if n == 0 {
+			return None;
+		}
+
+		let n_u32 = n as vk::DeviceSize * 4; // u32 per element
+		let sign_buf_size = ((n + 31) / 32) as vk::DeviceSize * 4;
+
+		// ── Create buffers ───────────────────────────────────────────────
+		let weights_buf = unsafe {
+			self.device
+				.create_buffer(
+					&vk::BufferCreateInfo::default()
+						.size(n_u32)
+						.usage(vk::BufferUsageFlags::STORAGE_BUFFER),
+					None,
+				)
+				.expect("Failed to create weights buffer")
+		};
+
+		let sign_buf = unsafe {
+			self.device
+				.create_buffer(
+					&vk::BufferCreateInfo::default()
+						.size(sign_buf_size)
+						.usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC),
+					None,
+				)
+				.expect("Failed to create sign buffer")
+		};
+
+		let packed_buf = unsafe {
+			self.device
+				.create_buffer(
+					&vk::BufferCreateInfo::default()
+						.size(n_u32)
+						.usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC),
+					None,
+				)
+				.expect("Failed to create packed buffer")
+		};
+
+		// Upload weights
+		let weights_bytes = bytemuck::cast_slice(weights);
+		unsafe { self.upload(weights_buf, 0, weights_bytes) };
+
+		// ── Create descriptor set (3 bindings: weights, sign_pack, packed) ──
+		let bindings = [
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(0)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(1)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(2)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+		];
+
+		let descriptor_set_layout = unsafe {
+			self.device
+				.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
+				.expect("Failed to create descriptor set layout")
+		};
+
+		let pool_size = vk::DescriptorPoolSize::default()
+			.ty(vk::DescriptorType::STORAGE_BUFFER)
+			.descriptor_count(3);
+		let descriptor_pool = unsafe {
+			self.device
+				.create_descriptor_pool(
+					&vk::DescriptorPoolCreateInfo::default()
+						.max_sets(1)
+						.pool_sizes(std::slice::from_ref(&pool_size)),
+					None,
+				)
+				.expect("Failed to create descriptor pool")
+		};
+
+		let descriptor_set = unsafe {
+			self.device
+				.allocate_descriptor_sets(
+					&vk::DescriptorSetAllocateInfo::default()
+						.descriptor_pool(descriptor_pool)
+						.set_layouts(std::slice::from_ref(&descriptor_set_layout)),
+			 )
+				.expect("Failed to allocate descriptor sets")[0]
+		};
+
+		// Bind buffers to descriptors
+		let buf_infos = [
+			vk::DescriptorBufferInfo::default().buffer(weights_buf).offset(0).range(vk::WHOLE_SIZE),
+			vk::DescriptorBufferInfo::default().buffer(sign_buf).offset(0).range(vk::WHOLE_SIZE),
+			vk::DescriptorBufferInfo::default().buffer(packed_buf).offset(0).range(vk::WHOLE_SIZE),
+		];
+
+		let writes = [
+			vk::WriteDescriptorSet::default()
+				.dst_set(descriptor_set)
+				.dst_binding(0)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.buffer_info(std::slice::from_ref(&buf_infos[0])),
+			vk::WriteDescriptorSet::default()
+				.dst_set(descriptor_set)
+				.dst_binding(1)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.buffer_info(std::slice::from_ref(&buf_infos[1])),
+			vk::WriteDescriptorSet::default()
+				.dst_set(descriptor_set)
+				.dst_binding(2)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.buffer_info(std::slice::from_ref(&buf_infos[2])),
+		];
+		unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+		// ── Load shader ──────────────────────────────────────────────────
+		const SHADER_BYTES: &[u8] = include_bytes!("../models/dedupe/quantize_gemv.spv");
+		let shader_u32 = unsafe {
+			std::slice::from_raw_parts(SHADER_BYTES.as_ptr() as *const u32, SHADER_BYTES.len() / 4)
+		};
+		let shader_module = unsafe {
+			self.device
+				.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(shader_u32), None)
+				.expect("Failed to create shader module")
+		};
+
+		let push_range = vk::PushConstantRange::default()
+			.stage_flags(vk::ShaderStageFlags::COMPUTE)
+			.offset(0)
+			.size(4); // total_elements as u32
+		let pipeline_layout = unsafe {
+			self.device
+				.create_pipeline_layout(
+					&vk::PipelineLayoutCreateInfo::default()
+						.set_layouts(std::slice::from_ref(&descriptor_set_layout))
+						.push_constant_ranges(std::slice::from_ref(&push_range)),
+					None,
+			 )
+				.expect("Failed to create pipeline layout")
+		};
+
+		let entry_point = std::ffi::CString::new("main").unwrap();
+		let stage = vk::PipelineShaderStageCreateInfo::default()
+			.stage(vk::ShaderStageFlags::COMPUTE)
+			.module(shader_module)
+			.name(&entry_point);
+
+		let pipeline = unsafe {
+			self.device
+				.create_compute_pipelines(
+					vk::PipelineCache::null(),
+					&[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
+					None,
+			 )
+				.expect("Failed to create compute pipeline")[0]
+		};
+
+		// ── Dispatch ─────────────────────────────────────────────────────
+		let local_size = 128u32;
+		let groups = (n as u32 + local_size - 1) / local_size;
+
+		let cmd = unsafe {
+			self.device
+				.allocate_command_buffers(
+					&vk::CommandBufferAllocateInfo::default()
+						.command_pool(self.command_pool)
+						.level(vk::CommandBufferLevel::PRIMARY)
+						.command_buffer_count(1),
+			 )
+				.expect("Failed to allocate command buffer")[0]
+		};
+
+		unsafe {
+			self.device
+				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+				.expect("Failed to begin command buffer");
+
+			self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+			self.device.cmd_bind_descriptor_sets(
+				cmd,
+				vk::PipelineBindPoint::COMPUTE,
+				pipeline_layout,
+				0,
+				std::slice::from_ref(&descriptor_set),
+				&[],
+			);
+			let bytes = (n as u32).to_ne_bytes();
+		self.device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+			self.device.cmd_dispatch(cmd, groups, 1, 1);
+
+			self.device
+				.end_command_buffer(cmd)
+				.expect("Failed to end command buffer");
+		}
+
+		let fence = unsafe {
+			self.device
+				.create_fence(&vk::FenceCreateInfo::default(), None)
+				.expect("Failed to create fence")
+		};
+
+		unsafe {
+			self.device
+				.queue_submit(
+					self.queue,
+					&[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
+					fence,
+			 )
+				.expect("Failed to submit compute");
+
+			self.device
+				.wait_for_fences(&[fence], true, u64::MAX)
+				.expect("Failed to wait for compute fence");
+		}
+
+		// ── Download results ─────────────────────────────────────────────
+		let signs_raw = unsafe { self.download(sign_buf, 0, sign_buf_size) };
+		let packed_raw = unsafe { self.download(packed_buf, 0, n_u32) };
+
+		// ── Unpack: signs from sign_pack buffer ──────────────────────────
+		let signs_count = (n + 31) / 32;
+		let mut signs = vec![0u32; signs_count];
+		for (i, chunk) in signs_raw.chunks_exact(4).enumerate() {
+			if i < signs_count {
+				signs[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+			}
+		}
+
+		// ── Unpack: prefix_ints and tails from packed buffer ──────────────
+		// Shader packs: packed_data_u32[idx/2] = (s_prefix_tails[idx+1] << 16) | s_prefix_tails[idx]
+		// s_prefix_tails = (tail_int << 8) | (prefix & 0xFF)
+		let mut prefix_ints = Vec::with_capacity(n);
+		let mut tails = Vec::with_capacity(n);
+
+		for chunk in packed_raw.chunks_exact(4) {
+			let combined = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+			let lo = combined & 0xFFFF;
+			let hi = (combined >> 16) & 0xFFFF;
+
+			// Each 16-bit half: (tail_int << 8) | prefix
+			for &val in &[lo, hi] {
+				let prefix = val & 0xFF;
+				let tail = (val >> 8) & 0xFF;
+				prefix_ints.push(prefix as u32);
+				tails.push(tail);
+			}
+		}
+
+		// Trim to exact count (last pair may have padding)
+		prefix_ints.truncate(n);
+		tails.truncate(n);
+
+		// ── Cleanup ──────────────────────────────────────────────────────
+		unsafe {
+			self.device.destroy_fence(fence, None);
+			self.device.free_command_buffers(self.command_pool, &[cmd]);
+			self.device.destroy_buffer(weights_buf, None);
+			self.device.destroy_buffer(sign_buf, None);
+			self.device.destroy_buffer(packed_buf, None);
+			self.device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+			self.device.destroy_descriptor_pool(descriptor_pool, None);
+			self.device.destroy_pipeline(pipeline, None);
+			self.device.destroy_pipeline_layout(pipeline_layout, None);
+			self.device.destroy_shader_module(shader_module, None);
+		}
+
+		Some(GpuQuantizeOutput {
+			prefix_ints,
+			tails,
+			signs,
+		})
+	}
 }
 
 impl Drop for GpuMemory {

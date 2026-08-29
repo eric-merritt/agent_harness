@@ -256,52 +256,25 @@ impl VirtualTensorArena {
         }
     }
 
-    // Inside your VirtualTensorArena implementation or dispatcher loop
-    pub unsafe fn dispatch_gpu_quantization(
-        &self,
-        device: &ash::Device,
-        command_buffer: vk::CommandBuffer,
-        pipeline: vk::Pipeline,
-        pipeline_layout: vk::PipelineLayout,
-        descriptor_set: vk::DescriptorSet,
-        rows: u32,
-        cols: u32,
-        group_size: u32,
-    ) {
-        // Bind your uniform descriptor sets pointing to the sparse_buffer 
-        unsafe {
-            device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            0,
-            &[descriptor_set],
-            &[],
-            )
-        };
+				// Inside your VirtualTensorArena loop (Pass 1: Pure Quantization)
+		pub unsafe fn dispatch_gpu_quantization(
+				&self,
+				device: &ash::Device,
+				command_buffer: vk::CommandBuffer,
+				pipeline: vk::Pipeline,
+				pipeline_layout: vk::PipelineLayout,
+				descriptor_set: vk::DescriptorSet,
+				total_elements: u32, // Flattened 1D tracking
+		) {
+				unsafe { device.cmd_bind_descriptor_sets(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[descriptor_set], &[]) };
+				unsafe { device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline) };
+				
+				// Pass only the total element element bounds
+				let bytes = total_elements.to_ne_bytes();
+				unsafe { device.cmd_push_constants(command_buffer, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes) };
 
-        unsafe {
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-        };
-        // Push dimensional bounds parameters natively into the shader registers
-        let push_constants = [rows, cols, group_size];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 12)
-        };
-        unsafe {
-            device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            bytes,
-        )};
+				let group_count_x = (total_elements + 127) / 128;
+				unsafe { device.cmd_dispatch(command_buffer, group_count_x, 1, 1) };
+		}
 
-        // Calculate optimal grid size grid blocks
-        let total_elements = rows * cols;
-        let group_count_x = (total_elements + 127) / 128;
-
-        // Launch execution thread grid directly over the Vulkan sparse buffer shell
-        unsafe {device.cmd_dispatch(command_buffer, group_count_x, 1, 1) };
-    }
 }

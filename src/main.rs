@@ -6,6 +6,7 @@ use agent_harness::*;
 use std::env;
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 
 /// File wrapper that auto-flushes after every write — env_logger's Target::Pipe
 /// uses buffered File by default, which delays log visibility until the buffer fills.
@@ -23,6 +24,24 @@ impl Write for AutoFlushFile {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+
+	    // Tell Cargo to rerun this script if the shader changes
+    println!("cargo:rerun-if-changed=src/models/dedupe/quantize_gemv.comp");
+
+    let status = Command::new("glslangValidator")
+        .args(&[
+            "-V", 
+            "-S", "comp", 
+            "src/models/dedupe/quantize_gemv.comp", 
+            "-o", "src/models/dedupe/quantize_gemv.spv"
+        ])
+        .status()
+        .expect("Failed to execute glslangValidator");
+
+    if !status.success() {
+        panic!("Shader compilation failed!");
+    }
+
 	// ── Logging: always on at INFO, DEBUG with --verbose ──
 	// Write to a log file so logs don't corrupt the TUI alt screen.
 	let verbose = std::env::args().any(|a| a == "--verbose" || a == "-v");

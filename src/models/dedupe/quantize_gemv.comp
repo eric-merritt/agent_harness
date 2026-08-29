@@ -1,135 +1,69 @@
 #version 450
 #extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_EXT_shader_atomic_float : enable 
+#extension GL_KHR_shader_subgroup_shuffle : enable
 
-// Optimize local workgroup size for the RTX 4080 Super (Ada Lovelace)
-// 128 threads per block matches the physical execution width of an SM sub-block
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128) in;
 
-// 1. Mapped to your VirtualTensorArena.sparse_buffer
-layout(std430, set = 0, binding = 0) readonly buffer SparseWeights {
+// Use layout qualifiers that match a linear 1D layout over the sparse buffer shell
+layout(std430, set = 0, binding = 0) readonly buffer SourceWeights {
     float weights[];
 };
 
-// 2. Vector X input
-layout(std430, set = 0, binding = 1) readonly buffer InputX {
-    float x[];
+// Destination blocks allocated directly inside the Virtual Arena memory array
+layout(std430, set = 0, binding = 1) writeonly buffer SignOutput {
+    uint sign_pack_u32[]; // 1 bit per element, 32 elements per u32
 };
 
-// 3. Row/Group Scales
-layout(std430, set = 0, binding = 2) readonly buffer Scales {
-    float scales[];
-};
-
-// 4. Output Integer Destinations
-layout(std430, set = 0, binding = 3) writeonly buffer OutIntegers {
-    int out_integers[];
-};
-
-// 5. Compressed 1-bit Sign Bit Array (True Quantized Form)
-layout(std430, set = 0, binding = 4) writeonly buffer SignPack {
-    uint sign_pack_u32[];
-};
-
-// 6. Final GEMV vector output
-layout(std430, set = 0, binding = 5) writeonly buffer OutVector {
-    float out_vector[];
+layout(std430, set = 0, binding = 2) writeonly buffer QuantizedOutput {
+    uint packed_data[]; // prefix+tail pairs, one per element
 };
 
 layout(push_constant) uniform PushConstants {
-    uint rows;
-    uint cols;
-    uint group_size;
+    uint total_elements;
 } params;
 
-// Shared memory configuration for intra-block row accumulations
-shared float s_clump[128];
-
 void main() {
-    uint global_idx = gl_GlobalInvocationID.x;
-    uint local_idx  = gl_LocalInvocationID.x;
-    
-    // Determine matrix row and column boundaries
-    uint r = global_idx / params.cols;
-    uint c = global_idx % params.cols;
-    uint total_elements = params.rows * params.cols;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.total_elements) return;
 
-    float weight = 0.0;
-    bool is_negative = false;
+    // Load original f32
+    float weight = weights[idx];
+    uint raw_bits = floatBitsToUint(weight);
+    bool is_negative = (raw_bits >> 31) != 0;
+    weight = abs(weight);
 
-    if (global_idx < total_elements) {
-        weight = weights[global_idx];
-        
-        // Isolate the IEEE-754 sign bit (Bit 31) using float-to-bit mapping
-        uint raw_bits = floatBitsToUint(weight);
-        is_negative = (raw_bits >> 31) != 0;
-        
-        weight = abs(weight);
-    }
-
-    // --- PHASE 1: Subgroup Ballot Sign Packing (Hardware 1-Bit Storage) ---
-    // Instantly aggregates 32 sign bits across the warp into a 4-byte uint mask
+    // 1. Packed Sign Processing (Warp-Coalesced)
     uvec4 ballot = subgroupBallot(is_negative);
-    uint warp_sign_mask = ballot.x; 
-
-    // Exactly one thread per warp commits the compressed 1-bit signs to global VRAM
-    uint lane_idx = gl_SubgroupInvocationID;
-    uint warp_idx = global_idx / 32;
-    if (lane_idx == 0 && (warp_idx * 32) < total_elements) {
-        sign_pack_u32[warp_idx] = warp_sign_mask;
+    if (gl_SubgroupInvocationID == 0) {
+        sign_pack_u32[idx / 32] = ballot.x;
     }
 
-    if (global_idx >= total_elements) return;
-
-    // --- PHASE 2: Base-10 Prefix Chopping ---
-    // Bypasses string conversions entirely using fast floating-point modulo
+    // 2. Quantization logic
     if (weight >= 10.0) {
         float integer_part;
-        float fractional_part = modf(weight * 0.01, integer_part);
-        weight = fractional_part * 100.0;
+        weight = modf(weight * 0.01, integer_part) * 100.0;
     }
+    uint prefix = uint(weight);
+    float tail_float = (weight - float(prefix)) * 1000.0;
 
-    // --- PHASE 3: Truncate 3 Bits from Mantissa with Round-to-Nearest-Even ---
-    uint f32_bits = floatBitsToUint(weight);
-    uint round_bit = 1 << 2;  // Bit 2 (highest discarded bit)
-    uint lsb_bit   = 1 << 3;  // Bit 3 (new target LSB position)
-
-    if ((f32_bits & round_bit) != 0) {
-        // Tie break logic: round up if lower fractional bits exist or if target LSB is odd
-        if ((f32_bits & (round_bit - 1)) != 0 || (f32_bits & lsb_bit) != 0) {
-            f32_bits += lsb_bit;
+    uint tail_bits = floatBitsToUint(tail_float);
+    uint round_bit = 1 << 2;
+    uint lsb_bit   = 1 << 3;
+    if ((tail_bits & round_bit) != 0) {
+        if ((tail_bits & (round_bit - 1)) != 0 || (tail_bits & lsb_bit) != 0) {
+            tail_bits += lsb_bit;
         }
     }
-    // Truncate the lowest 3 bits cleanly
-    f32_bits &= 0xFFFFFFF8;
-    weight = uintBitsToFloat(f32_bits);
+    tail_bits &= 0xFFFFFFF8;
+    uint tail_int = uint(round(uintBitsToFloat(tail_bits)));
 
-    // --- PHASE 4: Native Quantization Cast ---
-    int quantized_int = int(round(weight));
-    out_integers[global_idx] = quantized_int;
+    // Pack prefix and tail into a single u16 value
+    uint packaged_value = ((tail_int & 0xFF) << 8) | (prefix & 0xFF);
 
-    // --- PHASE 5: GEMV Linear Algebra Execution ---
-    float group_scale = scales[r / params.group_size];
-    float sign_multiplier = is_negative ? -1.0 : 1.0;
-    float dequantized = float(quantized_int) * sign_multiplier * group_scale;
-    
-    // Elements computed inside shared memory
-    s_clump[local_idx] = dequantized * x[c];
-    memoryBarrierShared();
-    barrier();
-
-    // Parallel reduction sequence within the local workgroup
-    for (uint stride = gl_WorkGroupSize.x / 2; stride > 0; stride >>= 1) {
-        if (local_idx < stride) {
-            s_clump[local_idx] += s_clump[local_idx + stride];
-        }
-        memoryBarrierShared();
-        barrier();
-    }
-
-    // Frame master accumulation writeouts back to destination vector
-    if (local_idx == 0) {
-        // Safe atomic addition to output feature dimension index
-        atomicAdd(out_vector[r], s_clump[0]);
+    // Warp-coalesced pair packing: pull sibling value from register, no memory race
+    uint sibling_value = subgroupShuffle(packaged_value, (gl_SubgroupInvocationID | 1));
+    if ((gl_SubgroupInvocationID % 2) == 0) {
+        uint pair_packed = (sibling_value << 16) | (packaged_value & 0xFFFF);
+        packed_data[idx / 2] = pair_packed;
     }
 }
