@@ -20,6 +20,16 @@ pub struct VirtualPage {
     pub cpu_offset: Option<usize>,
 }
 
+impl Clone for VirtualPage {
+    fn clone(&self) -> Self {
+        Self {
+            residency: self.residency,
+            gpu_allocation: None, // Allocation isn't Clone; workers don't need it for page writes
+            cpu_offset: self.cpu_offset,
+        }
+    }
+}
+
 pub struct VirtualTensorArena {
     pub total_virtual_size: vk::DeviceSize,
     pub page_size: vk::DeviceSize,
@@ -257,7 +267,19 @@ impl VirtualTensorArena {
     }
 
 				// Inside your VirtualTensorArena loop (Pass 1: Pure Quantization)
-		pub unsafe fn dispatch_gpu_quantization(
+		/// Shallow clone for parallel worker contexts — shares Arc handles.
+	pub fn clone_shallow(&self) -> Self {
+		Self {
+			total_virtual_size: self.total_virtual_size,
+			page_size: self.page_size,
+			total_pages: self.total_pages,
+			sparse_buffer: self.sparse_buffer,
+			page_table: self.page_table.clone(),
+			allocator: Arc::clone(&self.allocator),
+		}
+	}
+
+	pub unsafe fn dispatch_gpu_quantization(
 				&self,
 				device: &ash::Device,
 				command_buffer: vk::CommandBuffer,

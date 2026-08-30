@@ -15,5 +15,5 @@
 
 pub mod controller;
 pub mod cpu_mem_op;
-pub mod gpu_mem_op;
+// pub mod gpu_mem_op; // removed — operations live in controller.rs
 pub mod virtual_tensor_arena;

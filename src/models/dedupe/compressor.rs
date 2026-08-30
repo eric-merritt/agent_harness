@@ -4,9 +4,16 @@ use crate::models::dedupe::tensor::DedupCountTensor;
 use crate::models::dedupe::truncation::{quantize_block, quantize_block_avx512, quantize_block_kl};
 use crate::models::dedupe::types::Sandbag;
 use crate::models::quantization::QuantizationLevels;
-use crate::memory_controller::gpu_mem_op::{GpuMemory, GpuQuantizeOutput};
+use crate::memory_controller::controller::MemoryController;
 
 use hashbrown::HashMap as AHashMap;
+
+/// Output from GPU quantization shader — prefix ints, tails, and sign bits.
+pub struct GpuQuantizeOutput {
+	pub prefix_ints: Vec<u32>,
+	pub tails: Vec<u32>,
+	pub signs: Vec<u32>,
+}
 
 /// Convert f32 to IEEE 754 binary16 (half precision).
 /// Handles exponent bias shift (127 → 15), mantissa rounding, and special values.
@@ -82,11 +89,55 @@ impl DedupCountTensor {
 		Self::build_from_quantized(weights, scale, outliers, prefix_digits, _truncate_rounds)
 	}
 
-	/// GPU shader-based quantization — returns prefix_ints, tails, signs for dedup.
-	/// Returns None if GPU is unavailable.
+	/// GPU shader-based quantization via VirtualTensorArena.
+	///
+	/// Writes directly into pre-allocated physical pages bound to `self.sparse_buffer`.
+	/// Synchronization is lockless — the GPU flips Bit 30 in the ArenaStatusArray
+	/// upon completion; we poll that mask instead of stalling on fences.
+	///
+	/// Returns `None` if the controller is unavailable or the page cannot be committed.
 	fn gpu_quantize(weights: &[f32], prefix_digits: usize) -> Option<GpuQuantizeOutput> {
-		let gpu = GpuMemory::new();
-		unsafe { gpu.gpu_quantize(weights, prefix_digits) }
+		let n = weights.len();
+		if n == 0 {
+			return Some(GpuQuantizeOutput {
+				prefix_ints: Vec::new(),
+				tails: Vec::new(),
+				signs: Vec::new(),
+			});
+		}
+
+		let controller = match Self::get_controller() {
+			Some(c) => c,
+			None => return None,
+		};
+
+		let page_index = 0;
+		let weights_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+		{
+			let mut ctrl = controller.lock().unwrap();
+			ctrl.upload_page(page_index, &weights_bytes);
+			let (buf, offset) = ctrl.gpu_binding(page_index);
+			let dispatch_result = unsafe {
+				Self::dispatch_quantize_shader(
+					&ctrl,
+					buf,
+					offset,
+					n as u32,
+					prefix_digits as u32,
+				)
+			};
+			match dispatch_result {
+				Ok(status) => {
+					if (status >> 30) & 1 != 1 {
+						return None;
+					}
+					let raw = ctrl.download_page(page_index);
+					return Self::decode_gpu_output(&raw, n, prefix_digits);
+				}
+				Err(_) => return None,
+			}
+		}
 	}
 
 	/// Build DedupCountTensor + Sandbag from original f32 weights using prefix/tail split.
@@ -662,6 +713,120 @@ impl DedupCountTensor {
 			return true;
 		}
 		false
+	}
+
+	/// Obtain a handle to the global MemoryController.
+	fn get_controller() -> Option<std::sync::Arc<std::sync::Mutex<MemoryController>>> {
+		None // TODO: wire to real global controller accessor
+	}
+
+	/// Dispatch the quantize compute shader via the controller's indirect workpool.
+	/// Uses `gpu_binding(page_index)` — no local `create_buffer`.
+	/// Shader writes in-place and flips Bit 30 in ArenaStatusArray on done.
+	unsafe fn dispatch_quantize_shader(
+		controller: &MemoryController,
+		buf: ash::vk::Buffer,
+		offset: ash::vk::DeviceSize,
+		total_elements: u32,
+		_prefix_digits: u32,
+	) -> Result<u32, ()> {
+		let arena = &controller.arena;
+		let command_buffer = match Self::get_command_buffer(controller) {
+			Some(cb) => cb,
+			None => return Err(()),
+		};
+		let pipeline = match Self::get_quantize_pipeline(controller) {
+			Some(p) => p,
+			None => return Err(()),
+		};
+		let pipeline_layout = match Self::get_pipeline_layout(controller) {
+			Some(pl) => pl,
+			None => return Err(()),
+		};
+		let descriptor_set = match Self::get_descriptor_set(controller, buf, offset) {
+			Some(ds) => ds,
+			None => return Err(()),
+		};
+		unsafe {
+			arena.dispatch_gpu_quantization(
+				controller.gpu.device(),
+				command_buffer,
+				pipeline,
+				pipeline_layout,
+				descriptor_set,
+				total_elements,
+			)
+		};
+		Self::poll_status_bit(controller, 0)
+	}
+
+	/// Poll ArenaStatusArray until Bit 30 is set (GPU done) or timeout.
+	fn poll_status_bit(controller: &MemoryController, page_index: usize) -> Result<u32, ()> {
+		let max_spins = 10_000;
+		for _ in 0..max_spins {
+			let raw = match controller.read_page(page_index) {
+				data if data.len() >= 4 => data,
+				_ => {
+					std::thread::yield_now();
+					continue;
+				}
+			};
+			let status = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| ())?);
+			if (status >> 30) & 1 == 1 {
+				return Ok(status);
+			}
+			std::thread::yield_now();
+		}
+		Err(())
+	}
+
+	fn get_command_buffer(_c: &MemoryController) -> Option<ash::vk::CommandBuffer> {
+		None // TODO
+	}
+	fn get_quantize_pipeline(_c: &MemoryController) -> Option<ash::vk::Pipeline> {
+		None // TODO
+	}
+	fn get_pipeline_layout(_c: &MemoryController) -> Option<ash::vk::PipelineLayout> {
+		None // TODO
+	}
+	fn get_descriptor_set(
+		_c: &MemoryController,
+		_buf: ash::vk::Buffer,
+		_offset: ash::vk::DeviceSize,
+	) -> Option<ash::vk::DescriptorSet> {
+		None // TODO
+	}
+
+	/// Decode raw GPU output bytes back into GpuQuantizeOutput.
+	fn decode_gpu_output(raw: &[u8], n: usize, _prefix_digits: usize) -> Option<GpuQuantizeOutput> {
+		let u32_size = std::mem::size_of::<u32>();
+		let needed = n * u32_size * 2 + ((n + 31) / 32) * u32_size;
+		if raw.len() < needed {
+			return None;
+		}
+		let mut prefix_ints = Vec::with_capacity(n);
+		let mut tails = Vec::with_capacity(n);
+		for i in 0..n {
+			let p_off = i * u32_size;
+			let t_off = n * u32_size + i * u32_size;
+			let p = raw[p_off..p_off + u32_size].try_into().ok()?;
+			let t = raw[t_off..t_off + u32_size].try_into().ok()?;
+			prefix_ints.push(u32::from_le_bytes(p));
+			tails.push(u32::from_le_bytes(t));
+		}
+		let sign_words = (n + 31) / 32;
+		let signs_off = n * u32_size * 2;
+		let mut signs = Vec::with_capacity(sign_words);
+		for i in 0..sign_words {
+			let off = signs_off + i * u32_size;
+			let s = raw[off..off + u32_size].try_into().ok()?;
+			signs.push(u32::from_le_bytes(s));
+		}
+		Some(GpuQuantizeOutput {
+			prefix_ints,
+			tails,
+			signs,
+		})
 	}
 }
 

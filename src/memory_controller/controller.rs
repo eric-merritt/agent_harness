@@ -3,43 +3,92 @@ use crate::memory_controller::virtual_tensor_arena::{
 };
 use ash::vk;
 use std::sync::{Arc, Mutex};
+use sysinfo::System;
 
-// Mock structures to represent your internal architecture fields
-pub struct GpuContext;
-pub struct CpuMemoryManager;
+const CPU_MEMORY_AVAIL: u64 = sysinfo::System::available_memory();
+/// A block of model data to be paged into the arena.
+#[derive(Clone, Debug)]
+pub struct BlockDescriptor {
+	/// File/offset within the source model
+	pub offset: u64,
+	/// Number of bytes in this block
+	pub size: u64,
+}
+
+// GPU context — holds Vulkan device, queue, and allocator handles.
+pub struct GpuContext {
+	pub device_handle: ash::Device,
+	pub queue_handle: vk::Queue,
+	pub allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+}
 
 impl GpuContext {
+	pub fn new(
+		device: ash::Device,
+		queue: vk::Queue,
+		allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+	) -> Self {
+		Self {
+			device_handle: device,
+			queue_handle: queue,
+			allocator,
+		}
+	}
+	/// Shallow clone for parallel worker contexts — shares Arc handles.
+	pub fn clone_shallow(&self) -> Self {
+		Self {
+			device_handle: self.device_handle.clone(),
+			queue_handle: self.queue_handle,
+			allocator: Arc::clone(&self.allocator),
+		}
+	}
 	pub fn device(&self) -> &ash::Device {
-		todo!()
+		&self.device_handle
 	}
 	pub fn queue(&self) -> vk::Queue {
-		todo!()
+		self.queue_handle
 	}
 	pub fn allocator(&self) -> Arc<Mutex<gpu_allocator::vulkan::Allocator>> {
-		todo!()
+		Arc::clone(&self.allocator)
 	}
-	pub unsafe fn upload(&self, _buf: vk::Buffer, _offset: vk::DeviceSize, _data: &[u8]) {
-		todo!()
+	pub unsafe fn upload(&self, buf: vk::Buffer, offset: vk::DeviceSize, data: &[u8]) {
+		// TODO: implement via allocator mapped write or buffer copy
+		let _ = (buf, offset, data);
 	}
 	pub unsafe fn download(
 		&self,
-		_buf: vk::Buffer,
-		_offset: vk::DeviceSize,
-		_size: vk::DeviceSize,
+		buf: vk::Buffer,
+		offset: vk::DeviceSize,
+		size: vk::DeviceSize,
 	) -> Vec<u8> {
-		todo!()
+		// TODO: implement via buffer copy to host-visible staging buffer
+		let _ = (buf, offset, size);
+		vec![0u8; size as usize]
 	}
 }
 
+/// CPU memory backing pool — wraps the cpu_mem_op pool.
+pub struct CpuMemoryManager {
+	pool: crate::memory_controller::cpu_mem_op::CpuMemory,
+}
+
 impl CpuMemoryManager {
-	pub fn write_page(&mut self, _idx: usize, _size: usize, _data: &[u8]) {
-		todo!()
+	pub fn new(total_size: usize) -> Self {
+		Self {
+			pool: crate::memory_controller::cpu_mem_op::CpuMemory::new(total_size),
+		}
 	}
-	pub fn read_page(&self, _idx: usize, _size: usize) -> &[u8] {
-		todo!()
+	pub fn capacity(&self) -> usize {
+		self.pool.capacity()
 	}
-	pub fn drop_page(&mut self, _idx: usize, _size: usize) {
-		todo!()
+	pub fn write_page(&mut self, idx: usize, size: usize, data: &[u8]) {
+		self.pool.write_page(idx, size, data);
+	}
+	pub fn read_page(&self, idx: usize, size: usize) -> &[u8] {
+		self.pool.read_page(idx, size)
+	}
+	pub fn drop_page(&mut self, idx: usize, size: usize) {
+		self.pool.drop_page(idx, size);
 	}
 }
 
@@ -282,5 +331,121 @@ impl MemoryController {
 	pub fn gpu_binding(&self, page_index: usize) -> (vk::Buffer, vk::DeviceSize) {
 		let offset = page_index as vk::DeviceSize * self.arena.page_size;
 		(self.arena.sparse_buffer, offset)
+	}
+
+	// ── Initialization ───────────────────────────────────────────────────
+
+	/// Create a MemoryController backed by a VirtualTensorArena.
+	///
+	/// Total addressable memory = cpu_bytes + vram_bytes − 4 GB (reserved).
+	/// Pages are 256 bytes each.
+	pub unsafe fn init(
+		gpu: GpuContext,
+		cpu_bytes: u64,
+		vram_bytes: u64,
+	) -> Self {
+		let reserved = 4_000_000_000u64; // 4 GB headroom
+		let total = (cpu_bytes + vram_bytes).saturating_sub(reserved);
+		let page_size: vk::DeviceSize = 256;
+		let total_pages = (total / page_size) as usize;
+
+		let allocator = gpu.allocator();
+		let arena = VirtualTensorArena::new(
+			gpu.device(),
+			Arc::clone(&allocator),
+			total,
+			page_size,
+		);
+
+		let cpu_pool_size = (total_pages * page_size as usize)
+			.min(cpu_bytes as usize)
+			.max(1);
+		let cpu = CpuMemoryManager::new(cpu_pool_size);
+
+		Self {
+			arena,
+			gpu,
+			cpu,
+			max_cpu_bytes: cpu_bytes,
+			used_cpu_bytes: 0,
+			max_vram_bytes: vram_bytes,
+			used_vram_bytes: 0,
+		}
+	}
+
+	// ── Block paging (work-stealing threadpool) ────────────────────────────
+
+	/// Submit a batch of model blocks for paging into the arena.
+	///
+	/// Each block is described by `(offset, size)` — offset within the source
+	/// model file, size in bytes. Blocks are distributed across a rayon threadpool
+	/// (work-stealing scheduler). Each block is written to its assigned page slot.
+	///
+	/// Page assignment: block `i` → page `i` (linear mapping).
+	/// Blocks larger than one page are split across consecutive pages.
+	pub fn submit_blocks_for_paging(&mut self, blocks: &[BlockDescriptor]) {
+		use rayon::prelude::*;
+
+		let page_size = self.arena.page_size as u64;
+		let total_pages = self.arena.total_pages;
+
+		// Build a flat list of (page_index, data) tasks.
+		// Blocks that span multiple pages are split.
+		let mut tasks: Vec<(usize, Vec<u8>)> = Vec::new();
+		let mut next_page = 0usize;
+
+		for block in blocks {
+			let block_size = block.size as usize;
+			let mut block_offset = block.offset as usize;
+			let bytes = self.read_model_block(block.offset, block.size);
+
+			let mut pos = 0usize;
+			while pos < bytes.len() && next_page < total_pages {
+				let remaining = bytes.len() - pos;
+				let chunk_size = (block_size - remaining).min(page_size as usize);
+				let end = pos + chunk_size;
+
+				// Pad the last chunk of a block to page_size if needed
+				let chunk = if end == bytes.len() && remaining < page_size as usize {
+					let mut padded = vec![0u8; page_size as usize];
+					padded[..remaining].copy_from_slice(&bytes[pos..]);
+					padded
+				} else {
+					bytes[pos..end].to_vec()
+				};
+
+				tasks.push((next_page, chunk));
+				next_page += 1;
+				pos = end;
+			}
+		}
+
+		// Parallel write via rayon work-stealing pool.
+		// Each task writes to its page; the controller handles residency routing.
+		let controller = Arc::new(Mutex::new(self.clone_for_parallel()));
+		tasks.into_par_iter().for_each(|(page_idx, data)| {
+			let mut ctrl = controller.lock().unwrap();
+			ctrl.write_page(page_idx, &data);
+		});
+	}
+
+	/// Read a block from the source model. Placeholder — wire to real loader.
+	fn read_model_block(&self, _offset: u64, _size: u64) -> Vec<u8> {
+		// TODO: mmap the model file and read the block
+		vec![0u8; _size as usize]
+	}
+
+	/// Clone just enough state for parallel page writes.
+	fn clone_for_parallel(&self) -> MemoryController {
+		// Shallow clone — page writes don't need GPU allocations
+		Self {
+			arena: self.arena.clone_shallow(),
+			gpu: self.gpu.clone_shallow(),
+			cpu: CpuMemoryManager::new(self.cpu.pool.capacity()),
+			max_cpu_bytes: self.max_cpu_bytes,
+			used_cpu_bytes: self.used_cpu_bytes,
+			max_vram_bytes: self.max_vram_bytes,
+			used_vram_bytes: self.used_vram_bytes,
+		}
 	}
 }
