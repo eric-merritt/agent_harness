@@ -4,8 +4,10 @@
 // Compression is done once upfront; only decompression is timed.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::sync::{Arc, Mutex};
 
 use agent_harness::models::dedupe::tensor::DedupCountTensor;
+use agent_harness::models::dedupe::compressor::init_global_controller;
 
 /// Deterministic pseudo-random weights (LCG → Box-Muller → N(0, σ²)).
 /// σ=0.3 approximates typical transformer weight magnitudes.
@@ -39,6 +41,79 @@ fn make_weights(n: usize) -> Vec<f32> {
 	out
 }
 
+/// Initialize Vulkan + global MemoryController for GPU benchmarks.
+fn init_gpu() -> Result<(), String> {
+	use ash::vk;
+	use gpu_allocator::vulkan::AllocatorCreateDesc;
+	use gpu_allocator::AllocationSizes;
+
+	let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
+	let app_name = c"decompress_bench";
+	let app_info = vk::ApplicationInfo::default()
+		.application_name(&app_name)
+		.api_version(vk::API_VERSION_1_2);
+	let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+	let instance = unsafe { entry.create_instance(&instance_create_info, None) }
+		.map_err(|e| format!("create_instance failed: {:?}", e))?;
+
+	let phys_devices = unsafe { instance.enumerate_physical_devices() }
+		.map_err(|e| format!("enumerate_physical_devices failed: {:?}", e))?;
+	if phys_devices.is_empty() {
+		return Err("No Vulkan physical devices found".into());
+	}
+	let physical_device = phys_devices[0];
+
+	let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+	let queue_family_index = queue_families
+		.iter()
+		.position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+		.ok_or("No compute queue family found")? as u32;
+
+	let queue_family = vk::DeviceQueueCreateInfo::default()
+		.queue_family_index(queue_family_index)
+		.queue_priorities(&[1.0]);
+
+	let enabled_features = vk::PhysicalDeviceFeatures::default();
+	let queue_family_list = [queue_family];
+	let device_create_info = vk::DeviceCreateInfo::default()
+		.queue_create_infos(&queue_family_list)
+		.enabled_features(&enabled_features);
+
+	let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
+		.map_err(|e| format!("create device failed: {:?}", e))?;
+
+	let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
+	let allocator = gpu_allocator::vulkan::Allocator::new(&AllocatorCreateDesc {
+		instance,
+		device: device.clone(),
+		physical_device,
+		debug_settings: Default::default(),
+		buffer_device_address: false,
+		allocation_sizes: AllocationSizes::default(),
+	})
+	.map_err(|e| format!("allocator create failed: {:?}", e))?;
+
+	// Dummy instance for controller init (needs &Instance for memory property query)
+	let entry2 = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
+	let dummy_app = c"init_helper";
+	let dummy_app_info = vk::ApplicationInfo::default()
+		.application_name(&dummy_app)
+		.api_version(vk::API_VERSION_1_2);
+	let dummy_instance = unsafe { entry2.create_instance(&vk::InstanceCreateInfo::default().application_info(&dummy_app_info), None) }
+		.map_err(|e| format!("dummy instance failed: {:?}", e))?;
+
+	unsafe {
+		init_global_controller(
+			&dummy_instance,
+			physical_device,
+			device,
+			queue,
+			Arc::new(Mutex::new(allocator)),
+		)
+	}
+}
+
 /// Mean squared error between two vectors (same length).
 fn mse(a: &[f32], b: &[f32]) -> f32 {
 	let len = a.len().min(b.len());
@@ -62,6 +137,12 @@ fn bench_decompress(c: &mut Criterion) {
 	let truncate_rounds = 3;
 	let weights = make_weights(n);
 
+	// ── Initialize GPU ──
+	let gpu_init = init_gpu();
+	if let Err(ref e) = gpu_init {
+		eprintln!("decompress_bench: GPU init failed: {} — GPU benches will be skipped", e);
+	}
+
 	// Pre-compress all methods once
 	let (tensor_sp, sandbag_sp) =
 		DedupCountTensor::compress_quantized(&weights, prefix_digits, truncate_rounds);
@@ -84,30 +165,14 @@ fn bench_decompress(c: &mut Criterion) {
 		eprintln!("  {name:24} roundtrip_mse = {:.2e}", err);
 	}
 
-	// GPU pre-compute (uses new shader-based quantization)
-	let gpu_out = agent_harness::memory_controller::gpu_mem_op::try_gpu_quantize(&weights, prefix_digits);
-	if let Some(gpu_out) = &gpu_out {
-		let (tensor_gp, sandbag_gp) = DedupCountTensor::compress_from_gpu_percent(
-			&gpu_out.prefix_ints,
-			&gpu_out.tails,
-			&gpu_out.signs,
-			prefix_digits,
-			truncate_rounds,
-		);
-		let (tensor_gk, sandbag_gk) = DedupCountTensor::compress_from_gpu_kl(
-			&gpu_out.prefix_ints,
-			&gpu_out.tails,
-			&gpu_out.signs,
-			prefix_digits,
-			truncate_rounds,
-		);
-		for (name, tensor, sandbag) in [
-			("gpu_pure_percent", &tensor_gp, &sandbag_gp),
-			("gpu_pure_kl", &tensor_gk, &sandbag_gk),
-		] {
-			let recon = tensor.decompress_all(sandbag);
-			let err = mse(&weights, &recon);
-			eprintln!("  {name:24} roundtrip_mse = {:.2e}", err);
+	// GPU quantize — bucket output (reconstruction from buckets TODO)
+	if gpu_init.is_ok() {
+		let gpu_out = DedupCountTensor::gpu_quantize(&weights, prefix_digits);
+		if let Some(ref out) = gpu_out {
+			let tails = out.last_tail_per_block();
+			eprintln!("gpu_quantize last_tail_per_block: {:?}", tails);
+		} else {
+			eprintln!("gpu_quantize returned None despite GPU init");
 		}
 	}
 
@@ -143,37 +208,6 @@ fn bench_decompress(c: &mut Criterion) {
 			criterion::black_box(recon);
 		});
 	});
-
-	if let Some(gpu_out) = &gpu_out {
-		let (tensor_gp, sandbag_gp) = DedupCountTensor::compress_from_gpu_percent(
-			&gpu_out.prefix_ints,
-			&gpu_out.tails,
-			&gpu_out.signs,
-			prefix_digits,
-			truncate_rounds,
-		);
-		let (tensor_gk, sandbag_gk) = DedupCountTensor::compress_from_gpu_kl(
-			&gpu_out.prefix_ints,
-			&gpu_out.tails,
-			&gpu_out.signs,
-			prefix_digits,
-			truncate_rounds,
-		);
-
-		group.bench_function("gpu_pure_percent", |b| {
-			b.iter(|| {
-				let recon = tensor_gp.decompress_all(&sandbag_gp);
-				criterion::black_box(recon);
-			});
-		});
-
-		group.bench_function("gpu_pure_kl", |b| {
-			b.iter(|| {
-				let recon = tensor_gk.decompress_all(&sandbag_gk);
-				criterion::black_box(recon);
-			});
-		});
-	}
 
 	group.finish();
 }

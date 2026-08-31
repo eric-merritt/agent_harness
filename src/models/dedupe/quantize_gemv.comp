@@ -1,69 +1,99 @@
 #version 450
-#extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_KHR_shader_subgroup_shuffle : enable
 
 layout(local_size_x = 128) in;
 
-// Use layout qualifiers that match a linear 1D layout over the sparse buffer shell
+// Binding 0: Source weights — read-only input
 layout(std430, set = 0, binding = 0) readonly buffer SourceWeights {
     float weights[];
 };
 
-// Destination blocks allocated directly inside the Virtual Arena memory array
-layout(std430, set = 0, binding = 1) writeonly buffer SignOutput {
-    uint sign_pack_u32[]; // 1 bit per element, 32 elements per u32
+// Binding 1: Work pool — atomic claim/done bits
+layout(std430, set = 0, binding = 1) buffer GpuWorkPool {
+    uint work[];
 };
 
-layout(std430, set = 0, binding = 2) writeonly buffer QuantizedOutput {
-    uint packed_data[]; // prefix+tail pairs, one per element
+// Binding 2: Global counters — atomic allocation offsets per prefix
+layout(std430, set = 0, binding = 2) buffer GlobalCounters {
+    uint counters[];
+};
+
+// Binding 3: Bucket data — packed u8 tail output
+layout(std430, set = 0, binding = 3) buffer BucketData {
+    uint bucket[];
 };
 
 layout(push_constant) uniform PushConstants {
     uint total_elements;
+    uint bucket_max_capacity; // max u32 slots per bucket (padded)
 } params;
 
+#define COUNTER_BASE 0
+#define DATA_BASE 100
+
+// Shared memory allocations for intra-group staging
+shared uint s_local_counters[100];
+shared uint s_group_global_offsets[100];
+
 void main() {
+    uint local_idx = gl_LocalInvocationID.x;
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= params.total_elements) return;
 
-    // Load original f32
-    float weight = weights[idx];
-    uint raw_bits = floatBitsToUint(weight);
-    bool is_negative = (raw_bits >> 31) != 0;
-    weight = abs(weight);
+    // 1. Initialize local workgroup counters to 0
+    if (local_idx < 100) {
+        s_local_counters[local_idx] = 0;
+        s_group_global_offsets[local_idx] = 0u;
+    }
+    barrier();
 
-    // 1. Packed Sign Processing (Warp-Coalesced)
-    uvec4 ballot = subgroupBallot(is_negative);
-    if (gl_SubgroupInvocationID == 0) {
-        sign_pack_u32[idx / 32] = ballot.x;
+    uint prefix = 0;
+    uint tail = 0;
+    bool valid_element = (idx < params.total_elements);
+
+    if (valid_element) {
+        float weight = abs(weights[idx]);
+
+        // Uniformly extract the first two fractional digits as the prefix
+        // e.g., 0.39302838 * 100.0 = 39.302838 -> prefix = 39
+        float scaled_weight = weight * 100.0;
+        prefix = uint(floor(scaled_weight)) % 100u;
+
+        // Tail tracks the remaining digits scaled to match u8 resolution
+        float tail_float = (scaled_weight - floor(scaled_weight)) * 1000.0;
+        tail = min(uint(tail_float + 0.5), 255u);
     }
 
-    // 2. Quantization logic
-    if (weight >= 10.0) {
-        float integer_part;
-        weight = modf(weight * 0.01, integer_part) * 100.0;
+    // 2. Count elements locally within the fast L1 Cache Workgroup block first
+    uint local_pos = 0;
+    if (valid_element) {
+        local_pos = atomicAdd(s_local_counters[prefix], 1u);
     }
-    uint prefix = uint(weight);
-    float tail_float = (weight - float(prefix)) * 1000.0;
+    barrier();
 
-    uint tail_bits = floatBitsToUint(tail_float);
-    uint round_bit = 1 << 2;
-    uint lsb_bit   = 1 << 3;
-    if ((tail_bits & round_bit) != 0) {
-        if ((tail_bits & (round_bit - 1)) != 0 || (tail_bits & lsb_bit) != 0) {
-            tail_bits += lsb_bit;
+    // 3. Complete allocation step across ALL threads to avoid uninitialized states
+    if (local_idx < 100) {
+        uint total_group_count_for_prefix = s_local_counters[local_idx];
+        if (total_group_count_for_prefix > 0) {
+            s_group_global_offsets[local_idx] = atomicAdd(
+                counters[COUNTER_BASE + local_idx],
+                total_group_count_for_prefix
+            );
         }
     }
-    tail_bits &= 0xFFFFFFF8;
-    uint tail_int = uint(round(uintBitsToFloat(tail_bits)));
+    barrier(); // CRITICAL: Every thread must wait here before Step 4
 
-    // Pack prefix and tail into a single u16 value
-    uint packaged_value = ((tail_int & 0xFF) << 8) | (prefix & 0xFF);
+    // 4. Coalesce and write straight to global VRAM with clean hardware assignment
+    if (valid_element) {
+        uint global_pos = s_group_global_offsets[prefix] + local_pos;
+        uint bucket_base = DATA_BASE + (prefix * params.bucket_max_capacity);
+        uint u32_index = bucket_base + (global_pos / 4);
+        uint shift = (global_pos % 4) * 8;
 
-    // Warp-coalesced pair packing: pull sibling value from register, no memory race
-    uint sibling_value = subgroupShuffle(packaged_value, (gl_SubgroupInvocationID | 1));
-    if ((gl_SubgroupInvocationID % 2) == 0) {
-        uint pair_packed = (sibling_value << 16) | (packaged_value & 0xFFFF);
-        packed_data[idx / 2] = pair_packed;
+        // Atomic OR safely packs the u8 tail bytes into the global u32 word
+        atomicOr(bucket[u32_index], tail << shift);
+
+        // Signal completion in work pool (set DONE_BIT = bit 30)
+        if (local_pos == 0) {
+            atomicOr(work[idx], 1u << 30);
+        }
     }
 }

@@ -66,3 +66,15 @@ Thumbs.db
 *.out
 ```
 output/converted/
+filetree.pdf
+filetree.txt
+memory_controller_architecture.pdf
+memory_controller_architecture.txt
+perf.data
+perf.data.old
+qwen-output.html
+sys
+2026-08-31-072304-local-command-caveatcaveat-the-messages-below.txt
+2026-08-31-053742-local-command-caveatcaveat-the-messages-below.txt
+2026-08-31-044333-im-pretty-sure-youre-the-most-retarded-model-i.txt
+.~lock.memory_controller_architecture.txt#

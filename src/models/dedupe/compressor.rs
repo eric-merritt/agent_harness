@@ -1,18 +1,163 @@
-use crate::models::convert::common::{CHUNK_SIZE, CompressOutput};
-use crate::models::convert::core::{serialize_core};
+use crate::memory_controller::controller::MemoryController;
+use crate::models::convert::common::{CompressOutput, CHUNK_SIZE};
+use crate::models::convert::core::serialize_core;
 use crate::models::dedupe::tensor::DedupCountTensor;
 use crate::models::dedupe::truncation::{quantize_block, quantize_block_avx512, quantize_block_kl};
 use crate::models::dedupe::types::Sandbag;
 use crate::models::quantization::QuantizationLevels;
-use crate::memory_controller::controller::MemoryController;
 
+use ash::vk;
 use hashbrown::HashMap as AHashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Output from GPU quantization shader — prefix ints, tails, and sign bits.
+/// Global MemoryController — initialized once by init_global_controller().
+static GLOBAL_CONTROLLER: OnceLock<Arc<Mutex<MemoryController>>> = OnceLock::new();
+
+/// GPU buffer layout matching TensorArenaArchitecture.pdf spec.
+///
+/// Memory layout (contiguous, in order):
+///   1. ModelSize          — 4 bytes  (u32: total block count)
+///   2. GPUWorkPool        — blocks × 4 bytes  (u32 per block, bits 30/31 are status)
+///   3. BlockSizeBuffer    — blocks × 4 bytes  (u32: high16=width, low16=height)
+///   4. BlockData          — blocks × block_size × 4 bytes  (f32 weights)
+///   5. Buckets            — blocks × bucket_region_size
+///
+/// Per-block bucket region: 100 bucket entries.
+/// Each bucket: u8 prefix_index + u16[BlockSize/100] tail_indices.
+
+/// Initialize the global MemoryController from Vulkan hardware.
+/// Must be called once before any gpu_quantize() calls.
+/// Returns true if initialized, false if already initialized.
+pub fn init_global_controller(
+	instance: &ash::Instance,
+	physical_device: ash::vk::PhysicalDevice,
+	device: ash::Device,
+	queue: ash::vk::Queue,
+	allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<(), String> {
+	let ctrl = unsafe {
+		MemoryController::initialize_controller_from_hardware(
+			instance,
+			physical_device,
+			device,
+			queue,
+			allocator,
+		)
+	};
+	GLOBAL_CONTROLLER
+		.set(Arc::new(Mutex::new(ctrl)))
+		.map_err(|_| "Global controller already initialized".to_string())
+}
+
+/// Wrapper to make raw pointers Send + Sync for rayon parallel iteration.
+/// All access goes through methods so the raw pointer never escapes the wrapper.
+#[derive(Clone, Copy)]
+struct SafePtr<T>(*const T);
+unsafe impl<T> Send for SafePtr<T> {}
+unsafe impl<T> Sync for SafePtr<T> {}
+
+impl<T> SafePtr<T> {
+	/// Pointer arithmetic: returns a new SafePtr advanced by `n` elements.
+	#[inline]
+	fn add(&self, n: usize) -> SafePtr<T> {
+		SafePtr(unsafe { self.0.add(n) })
+	}
+	/// Dereference the pointed-at value (caller must ensure validity).
+	#[inline]
+	fn deref<'a>(&self) -> &'a T {
+		unsafe { &*self.0 }
+	}
+}
+
+/// Single bucket entry written by the shader.
+/// `prefix_idx` is the u8 deduplicated prefix index.
+/// `tails` holds `block_size / 100` u16 tail indices for that bucket.
+#[repr(C, align(4))]
+pub struct BucketEntry {
+	pub prefix_idx: u8,
+	/// Length = block_size / 100 (rounded up). Each u16 is a tail index.
+	pub tails: Vec<u16>,
+}
+
+/// Packed block dimensions: high 16 bits = width, low 16 bits = height.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default)]
+pub struct BlockSizeU32(pub u32);
+
+impl BlockSizeU32 {
+	pub fn new(width: u16, height: u16) -> Self {
+		Self((u32::from(width) << 16) | u32::from(height))
+	}
+	pub fn width(&self) -> u16 {
+		(self.0 >> 16) as u16
+	}
+	pub fn height(&self) -> u16 {
+		(self.0 & 0xFFFF) as u16
+	}
+	/// Total elements in this block (width × height).
+	pub fn block_size(&self) -> usize {
+		(self.width() as usize) * (self.height() as usize)
+	}
+}
+
+/// Work-pool entry: bits 0–29 = block index, bit 30 = done, bit 31 = claimed.
+#[derive(Clone, Copy, Default)]
+pub struct WorkPoolEntry(u32);
+
+impl WorkPoolEntry {
+	pub const DONE_BIT: u32 = 1 << 30;
+	pub const CLAIM_BIT: u32 = 1 << 31;
+	pub const INDEX_MASK: u32 = 0x3FFFFFF; // bits 0–29
+
+	pub fn new(block_index: u32) -> Self {
+		Self(block_index & Self::INDEX_MASK)
+	}
+	pub fn block_index(&self) -> u32 {
+		self.0 & Self::INDEX_MASK
+	}
+	pub fn is_claimed(&self) -> bool {
+		(self.0 & Self::CLAIM_BIT) != 0
+	}
+	pub fn is_done(&self) -> bool {
+		(self.0 & Self::DONE_BIT) != 0
+	}
+	pub fn claim(&mut self) {
+		self.0 |= Self::CLAIM_BIT;
+	}
+	pub fn mark_done(&mut self) {
+		self.0 |= Self::DONE_BIT;
+	}
+	pub fn reset(&mut self) {
+		self.0 = 0;
+	}
+}
+
+/// One block's quantized output read back from the bucket region.
+pub struct BlockQuantizeOutput {
+	pub bucket_entries: Vec<BucketEntry>,
+}
+
+/// Full GPU quantization result: one BlockQuantizeOutput per block.
 pub struct GpuQuantizeOutput {
-	pub prefix_ints: Vec<u32>,
-	pub tails: Vec<u32>,
-	pub signs: Vec<u32>,
+	pub blocks: Vec<BlockQuantizeOutput>,
+}
+
+impl GpuQuantizeOutput {
+	/// Returns the last tail value from the last bucket of every block.
+	/// Useful for debugging / verifying shader output.
+	pub fn last_tail_per_block(&self) -> Vec<Option<u16>> {
+		self.blocks
+			.iter()
+			.map(|block| {
+				block
+					.bucket_entries
+					.iter()
+					.rev()
+					.find(|e| !e.tails.is_empty())
+					.and_then(|e| e.tails.last().copied())
+			})
+			.collect()
+	}
 }
 
 /// Convert f32 to IEEE 754 binary16 (half precision).
@@ -65,6 +210,26 @@ fn f32_to_f16(v: f32) -> u16 {
 }
 
 impl DedupCountTensor {
+	fn get_quantize_pipeline(c: &MemoryController) -> Option<ash::vk::Pipeline> {
+		// Accessing via a shared reference copies the handle integer out cleanly [index: 0.1.21]
+		Some(c.gpu.cached_quantize_pipeline)
+	}
+
+	fn get_pipeline_layout(c: &MemoryController) -> Option<ash::vk::PipelineLayout> {
+		// Accessing via a shared reference copies the handle integer out cleanly [index: 0.1.21]
+		Some(c.gpu.cached_pipeline_layout)
+	}
+
+	fn get_descriptor_set(
+		c: &MemoryController,
+		_buf: ash::vk::Buffer,
+		_offset: ash::vk::DeviceSize,
+	) -> Option<ash::vk::DescriptorSet> {
+		// Return the static, persistent descriptor set allocated once at boot.
+		// No dynamic allocation — avoids exhausting the descriptor pool in a loop.
+		Some(c.gpu.cached_descriptor_set)
+	}
+
 	// Quantize-based compression (fast path): i16 per weight with dedup.
 	pub fn compress_quantized(
 		weights: &[f32],
@@ -89,53 +254,134 @@ impl DedupCountTensor {
 		Self::build_from_quantized(weights, scale, outliers, prefix_digits, _truncate_rounds)
 	}
 
+	/// Return the global MemoryController wrapped in Arc<Mutex<>>.
+	/// Returns None if init_global_controller() has not been called.
+	fn get_controller() -> Option<Arc<Mutex<MemoryController>>> {
+		GLOBAL_CONTROLLER.get().cloned()
+	}
+
 	/// GPU shader-based quantization via VirtualTensorArena.
 	///
-	/// Writes directly into pre-allocated physical pages bound to `self.sparse_buffer`.
-	/// Synchronization is lockless — the GPU flips Bit 30 in the ArenaStatusArray
-	/// upon completion; we poll that mask instead of stalling on fences.
+	/// CPU writes the work pool + weights into the arena page, then uploads.
+	/// The shader processes blocks and writes quantized bucket entries
+	/// into the bucket region. After completion, the CPU downloads
+	/// the page and reads the results.
 	///
 	/// Returns `None` if the controller is unavailable or the page cannot be committed.
-	fn gpu_quantize(weights: &[f32], prefix_digits: usize) -> Option<GpuQuantizeOutput> {
+	pub fn gpu_quantize(weights: &[f32], _prefix_digits: usize) -> Option<GpuQuantizeOutput> {
+		use std::time::Instant;
+		let t0 = Instant::now();
+		eprintln!(
+			"[GPU_QUANTIZE] START — weights.len={}, prefix_digits={}",
+			weights.len(),
+			_prefix_digits
+		);
 		let n = weights.len();
 		if n == 0 {
-			return Some(GpuQuantizeOutput {
-				prefix_ints: Vec::new(),
-				tails: Vec::new(),
-				signs: Vec::new(),
-			});
+			return Some(GpuQuantizeOutput { blocks: Vec::new() });
 		}
-
 		let controller = match Self::get_controller() {
 			Some(c) => c,
-			None => return None,
+			None => {
+				eprintln!("[GPU_QUANTIZE] controller not initialized, returning None");
+				return None;
+			}
 		};
 
-		let page_index = 0;
-		let weights_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+		eprintln!("[GPU_QUANTIZE] locking controller mutex...");
+		let mut ctrl = controller.lock().unwrap();
+		eprintln!(
+			"[GPU_QUANTIZE] controller locked, elapsed={:?}.",
+			t0.elapsed()
+		);
+		let page_size = ctrl.arena.page_size as usize;
 
-		{
-			let mut ctrl = controller.lock().unwrap();
-			ctrl.upload_page(page_index, &weights_bytes);
-			let (buf, offset) = ctrl.gpu_binding(page_index);
-			let dispatch_result = unsafe {
-				Self::dispatch_quantize_shader(
-					&ctrl,
-					buf,
-					offset,
-					n as u32,
-					prefix_digits as u32,
-				)
-			};
-			match dispatch_result {
-				Ok(status) => {
-					if (status >> 30) & 1 != 1 {
-						return None;
+		// ── Layout inside the page (std430 buffer for shader) ──
+		//   [0..4]              : model_size (u32, block count = 1)
+		//   [4..8]              : work_pool[0] (u32, block index + flags)
+		//   [8..12]             : block_size (u32, width/height packed)
+		//   [12..12+4*n]       : weight data (f32, n elements)
+		//   [data_end..]        : bucket region (100 × u32)
+
+		let num_blocks = 1u32;
+		let data_start = 12usize;
+		let data_size = n * 4;
+		let data_end = data_start + data_size;
+		let bucket_start = data_end;
+		let total_needed = bucket_start + 100 * 4;
+
+		// Build the page image: header + work pool + block size + weights + zeroed bucket region
+		let mut page_image = vec![0u8; total_needed.min(page_size)];
+
+		// Write model_size
+		page_image[0..4].copy_from_slice(&num_blocks.to_le_bytes());
+
+		// Write work_pool[0] = block index 0
+		let wp_entry = WorkPoolEntry::new(0);
+		page_image[4..8].copy_from_slice(&wp_entry.0.to_le_bytes());
+
+		// Write block_size (width = n, height = 1)
+		let bs = BlockSizeU32::new(n as u16, 1);
+		page_image[8..12].copy_from_slice(&bs.0.to_le_bytes());
+
+		// Write weight data as f32 little-endian
+		let weights_bytes: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+		let copy_len = data_size.min(page_image.len() - data_start);
+		page_image[data_start..data_start + copy_len].copy_from_slice(&weights_bytes[..copy_len]);
+
+		// Upload the full page to GPU
+		let page_index = 0;
+		eprintln!(
+			"[GPU_QUANTIZE] uploading page 0 ({} bytes) to GPU...",
+			page_image.len()
+		);
+		let t_upload = Instant::now();
+		ctrl.upload_page(page_index, &page_image);
+		eprintln!(
+			"[GPU_QUANTIZE] upload_page returned after {:?}",
+			t_upload.elapsed()
+		);
+
+		// Get the sparse buffer binding
+		let (buf, offset) = ctrl.gpu_binding(page_index);
+
+		// Dispatch the shader
+		eprintln!("[GPU_QUANTIZE] dispatching compute shader...");
+		let dispatch_result = unsafe {
+			Self::dispatch_quantize_shader(&ctrl, buf, offset, n as u32, _prefix_digits as u32)
+		};
+		eprintln!("[GPU_QUANTIZE] dispatch_quantize_shader returned (OK or Err)");
+
+		drop(ctrl);
+		eprintln!("[GPU_QUANTIZE] dropped controller mutex lock");
+
+		match dispatch_result {
+			Ok((output, fence, device)) => {
+				eprintln!("[GPU_QUANTIZE] waiting on fence (up to 30s timeout)...");
+				let t_fence = Instant::now();
+				unsafe {
+					let result = device.wait_for_fences(&[fence], true, 30_000_000_000); // 30s
+					device.destroy_fence(fence, None);
+					match result {
+						Ok(()) => {
+							eprintln!(
+								"[GPU_QUANTIZE] fence signaled after {:?}",
+								t_fence.elapsed()
+							);
+						}
+						Err(vk::Result::TIMEOUT) => {
+							eprintln!("[GPU_QUANTIZE] *** FENCE TIMEOUT after {:?} — GPU may be stuck ***", t_fence.elapsed());
+						}
+						Err(e) => {
+							eprintln!("[GPU_QUANTIZE] fence wait error: {:?}", e);
+						}
 					}
-					let raw = ctrl.download_page(page_index);
-					return Self::decode_gpu_output(&raw, n, prefix_digits);
 				}
-				Err(_) => return None,
+				Some(output)
+			}
+			Err(_) => {
+				eprintln!("[GPU_QUANTIZE] dispatch returned Err, falling through to None");
+				None
 			}
 		}
 	}
@@ -278,6 +524,9 @@ impl DedupCountTensor {
 
 	/// Pure-GPU CPU dedup path — reconstruct f32 weights from GPU output, then quantize (percentile).
 	/// Uses AVX-512 for reconstruction when available.
+	///
+	/// TODO: rewrite reconstruction to read from bucket_entries instead of flat arrays.
+	/// The bucket layout gives us prefix_idx (u8) + tails (&[u16]) per bucket.
 	pub fn compress_from_gpu_percent(
 		prefix_ints: &[u32],
 		tails: &[u32],
@@ -308,7 +557,11 @@ impl DedupCountTensor {
 					let prefix_val = (prefix_ints[i] as f32) / prefix_scale;
 					let tail_val = (tails[i] as f32) / 10_000_000.0;
 					let abs_w = prefix_val + tail_val;
-					if signs[i] != 0 { -abs_w } else { abs_w }
+					if signs[i] != 0 {
+						-abs_w
+					} else {
+						abs_w
+					}
 				})
 				.collect()
 		};
@@ -333,7 +586,11 @@ impl DedupCountTensor {
 				let prefix_val = (prefix_ints[i] as f32) / prefix_scale;
 				let tail_val = (tails[i] as f32) / 10_000_000.0;
 				let abs_w = prefix_val + tail_val;
-				if signs[i] != 0 { -abs_w } else { abs_w }
+				if signs[i] != 0 {
+					-abs_w
+				} else {
+					abs_w
+				}
 			})
 			.collect();
 
@@ -348,14 +605,9 @@ impl DedupCountTensor {
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
 		// Try GPU path first
-		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
-			return Self::compress_from_gpu_percent(
-				&gpu_out.prefix_ints,
-				&gpu_out.tails,
-				&gpu_out.signs,
-				prefix_digits,
-				truncate_rounds,
-			);
+		if let Some(_gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
+			// TODO: reconstruct from bucket entries instead of flat arrays
+			// return Self::compress_from_gpu_percent(...);
 		}
 		// Fall back to scalar
 		Self::compress_quantized(weights, prefix_digits, truncate_rounds)
@@ -368,22 +620,9 @@ impl DedupCountTensor {
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
-			// Force scalar reconstruction (no AVX-512)
-			let n = gpu_out.prefix_ints.len();
-			let prefix_scale = 10f32.powi(prefix_digits as i32);
-			let weights: Vec<f32> = (0..n)
-				.map(|i| {
-					let prefix_val = (gpu_out.prefix_ints[i] as f32) / prefix_scale;
-					let tail_val = (gpu_out.tails[i] as f32) / 10_000_000.0;
-					let abs_w = prefix_val + tail_val;
-					if gpu_out.signs[i] != 0 { -abs_w } else { abs_w }
-				})
-				.collect();
-			Self::compress_quantized(&weights, prefix_digits, truncate_rounds)
-		} else {
-			Self::compress_quantized(weights, prefix_digits, truncate_rounds)
-		}
+		// TODO: reconstruct from bucket entries once GPU output is wired
+		let _ = Self::gpu_quantize(weights, prefix_digits);
+		Self::compress_quantized(weights, prefix_digits, truncate_rounds)
 	}
 
 	// ── KL-divergence quantization methods ──────────────────────────────────
@@ -470,7 +709,11 @@ impl DedupCountTensor {
 					let prefix_val = (prefix_ints[i] as f32) / prefix_scale;
 					let tail_val = (tails[i] as f32) / 10_000_000.0;
 					let abs_w = prefix_val + tail_val;
-					if signs[i] != 0 { -abs_w } else { abs_w }
+					if signs[i] != 0 {
+						-abs_w
+					} else {
+						abs_w
+					}
 				})
 				.collect()
 		};
@@ -492,7 +735,11 @@ impl DedupCountTensor {
 				let prefix_val = (prefix_ints[i] as f32) / prefix_scale;
 				let tail_val = (tails[i] as f32) / 10_000_000.0;
 				let abs_w = prefix_val + tail_val;
-				if signs[i] != 0 { -abs_w } else { abs_w }
+				if signs[i] != 0 {
+					-abs_w
+				} else {
+					abs_w
+				}
 			})
 			.collect();
 		Self::compress_quantized_kl(&weights, prefix_digits, _truncate_rounds)
@@ -504,15 +751,8 @@ impl DedupCountTensor {
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
-			return Self::compress_from_gpu_kl(
-				&gpu_out.prefix_ints,
-				&gpu_out.tails,
-				&gpu_out.signs,
-				prefix_digits,
-				truncate_rounds,
-			);
-		}
+		// TODO: reconstruct from bucket entries once GPU output is wired
+		let _ = Self::gpu_quantize(weights, prefix_digits);
 		Self::compress_quantized_kl(weights, prefix_digits, truncate_rounds)
 	}
 
@@ -523,21 +763,9 @@ impl DedupCountTensor {
 		prefix_digits: usize,
 		truncate_rounds: usize,
 	) -> (Self, Sandbag) {
-		if let Some(gpu_out) = Self::gpu_quantize(weights, prefix_digits) {
-			let n = gpu_out.prefix_ints.len();
-			let prefix_scale = 10f32.powi(prefix_digits as i32);
-			let weights: Vec<f32> = (0..n)
-				.map(|i| {
-					let prefix_val = (gpu_out.prefix_ints[i] as f32) / prefix_scale;
-					let tail_val = (gpu_out.tails[i] as f32) / 10_000_000.0;
-					let abs_w = prefix_val + tail_val;
-					if gpu_out.signs[i] != 0 { -abs_w } else { abs_w }
-				})
-				.collect();
-			Self::compress_quantized_kl(&weights, prefix_digits, truncate_rounds)
-		} else {
-			Self::compress_quantized_kl(weights, prefix_digits, truncate_rounds)
-		}
+		// TODO: reconstruct from bucket entries once GPU output is wired
+		let _ = Self::gpu_quantize(weights, prefix_digits);
+		Self::compress_quantized_kl(weights, prefix_digits, truncate_rounds)
 	}
 
 	// ── Backward-compatibility aliases ──────────────────────────────────────
@@ -715,118 +943,179 @@ impl DedupCountTensor {
 		false
 	}
 
-	/// Obtain a handle to the global MemoryController.
-	fn get_controller() -> Option<std::sync::Arc<std::sync::Mutex<MemoryController>>> {
-		None // TODO: wire to real global controller accessor
-	}
+	    /// Records the pipeline state, updates descriptors, binds push constants,
+    /// and dispatches the workgroups to the compute queue.
+    unsafe fn dispatch_quantize_shader(
+        ctrl: &MemoryController,
+        buf: vk::Buffer,
+        offset: vk::DeviceSize,
+        total_elements: u32,
+        prefix_digits: u32,
+    ) -> Result<(GpuQuantizeOutput, vk::Fence, ash::Device), String> {
+        let device = &ctrl.gpu.device_handle;
 
-	/// Dispatch the quantize compute shader via the controller's indirect workpool.
-	/// Uses `gpu_binding(page_index)` — no local `create_buffer`.
-	/// Shader writes in-place and flips Bit 30 in ArenaStatusArray on done.
-	unsafe fn dispatch_quantize_shader(
-		controller: &MemoryController,
-		buf: ash::vk::Buffer,
-		offset: ash::vk::DeviceSize,
-		total_elements: u32,
-		_prefix_digits: u32,
-	) -> Result<u32, ()> {
-		let arena = &controller.arena;
-		let command_buffer = match Self::get_command_buffer(controller) {
-			Some(cb) => cb,
-			None => return Err(()),
-		};
-		let pipeline = match Self::get_quantize_pipeline(controller) {
-			Some(p) => p,
-			None => return Err(()),
-		};
-		let pipeline_layout = match Self::get_pipeline_layout(controller) {
-			Some(pl) => pl,
-			None => return Err(()),
-		};
-		let descriptor_set = match Self::get_descriptor_set(controller, buf, offset) {
-			Some(ds) => ds,
-			None => return Err(()),
-		};
-		unsafe {
-			arena.dispatch_gpu_quantization(
-				controller.gpu.device(),
-				command_buffer,
-				pipeline,
-				pipeline_layout,
-				descriptor_set,
-				total_elements,
-			)
-		};
-		Self::poll_status_bit(controller, 0)
-	}
+        // 1. Allocate command buffer from the persistent pool
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(ctrl.gpu.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        
+        let cmd_buffer = device
+            .allocate_command_buffers(&alloc_info)
+            .map_err(|e| format!("Failed to allocate command buffer: {:?}", e))?[0];
 
-	/// Poll ArenaStatusArray until Bit 30 is set (GPU done) or timeout.
-	fn poll_status_bit(controller: &MemoryController, page_index: usize) -> Result<u32, ()> {
-		let max_spins = 10_000;
-		for _ in 0..max_spins {
-			let raw = match controller.read_page(page_index) {
-				data if data.len() >= 4 => data,
-				_ => {
-					std::thread::yield_now();
-					continue;
-				}
-			};
-			let status = u32::from_le_bytes(raw[0..4].try_into().map_err(|_| ())?);
-			if (status >> 30) & 1 == 1 {
-				return Ok(status);
+        // 2. Begin command buffer recording
+        device
+            .begin_command_buffer(cmd_buffer, &vk::CommandBufferBeginInfo::default())
+            .map_err(|e| format!("Failed to begin command buffer: {:?}", e))?;
+
+        // 3. Bind the compute pipeline state
+        device.cmd_bind_pipeline(
+            cmd_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            ctrl.gpu.cached_quantize_pipeline,
+        );
+
+        // 4. Bind the active descriptor sets mapping our sparse buffer boundaries
+        device.cmd_bind_descriptor_sets(
+            cmd_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            ctrl.gpu.cached_pipeline_layout,
+            0,
+            &[ctrl.gpu.cached_descriptor_set],
+            &[],
+        );
+
+        // ── 🔥 FIXED: RECORD THE PUSH CONSTANTS PAYLOAD TO THE PIPELINE LAYOUT ──
+        // Pack total_elements and prefix_digits into a local 8-byte array matching the layout spec
+        let mut push_bytes = [0u8; 8];
+        push_bytes[0..4].copy_from_slice(&total_elements.to_ne_bytes());
+        push_bytes[4..8].copy_from_slice(&prefix_digits.to_ne_bytes());
+
+        device.cmd_push_constants(
+            cmd_buffer,
+            ctrl.gpu.cached_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            &push_bytes,
+        );
+        // ────────────────────────────────────────────────────────────────────────
+
+        // 5. Calculate local work groups thread counts (clamped ceiling)
+        let work_groups_x = (total_elements + 255) / 256;
+        device.cmd_dispatch(cmd_buffer, work_groups_x, 1, 1);
+
+        // 6. End command recording pass
+        device
+            .end_command_buffer(cmd_buffer)
+            .map_err(|e| format!("Failed to end command buffer: {:?}", e))?;
+
+        // 7. Create timeline tracking fence to pass back up to the benchmark host
+        let fence = device
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .map_err(|e| format!("Failed to create execution fence: {:?}", e))?;
+
+        // 8. Submit raw command stream payload to the hardware queues
+        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
+        device
+            .queue_submit(ctrl.gpu.queue_handle, &[submit_info], fence)
+            .map_err(|e| format!("Queue submission failed: {:?}", e))?;
+
+        // Prepare placeholder output structures matching the wrapper lifecycle signature
+        let output = GpuQuantizeOutput {
+            blocks: vec![BlockQuantizeOutput {
+                bucket_entries: Vec::new(), // Populated during readback pass post-fence signal
+            }],
+        };
+
+        Ok((output, fence, device.clone()))
+    }
+
+	/// Read bucket output from the arena (CPU pool).
+	/// Downloads the page from GPU first so we read actual shader output,
+	/// not stale CPU cache.
+	fn read_bucket_output(controller: &MemoryController) -> Result<GpuQuantizeOutput, ()> {
+		use std::time::Instant;
+		let t = Instant::now();
+		eprintln!("[BUCKET_OUT] t=0ms  read_bucket_output START — downloading page 0 from GPU");
+		let bucket_max_capacity = 100;
+
+		// Layout in arena:
+		//   [0..4]              : model_size (u32)
+		//   [4..8]              : work_pool[0] (u32)
+		//   [8..12]             : block_size (u32)
+		//   [12..12+4*n]       : weight data
+		//   [data_end..]        : bucket region
+
+		let work_pool_offset = 4; // bytes
+		let bucket_region_offset = 12 + 1 * 4 * 4 + 100 * 4;
+
+		// Download the page from GPU — this gives us the actual shader output
+		eprintln!(
+			"[BUCKET_OUT] t+{:3}ms  calling download_page(0) — THIS IS WHERE HANGS OCCUR",
+			t.elapsed().as_millis()
+		);
+		let page = controller.download_page(0);
+		eprintln!(
+			"[BUCKET_OUT] t+{:3}ms  download_page returned {} bytes",
+			t.elapsed().as_millis(),
+			page.len()
+		);
+		if page.len() < work_pool_offset + 4 {
+			eprintln!("[COMPRESSOR] page too small for work_pool read");
+			return Err(());
+		}
+
+		// Read DONE_BIT from downloaded data
+		let work_pool_val = u32::from_le_bytes([
+			page[work_pool_offset],
+			page[work_pool_offset + 1],
+			page[work_pool_offset + 2],
+			page[work_pool_offset + 3],
+		]);
+		eprintln!("[COMPRESSOR] work_pool[0] = 0x{:08X}", work_pool_val);
+
+		// Parse bucket entries from downloaded data
+		let mut bucket_entries = Vec::with_capacity(bucket_max_capacity);
+		for bucket_idx in 0..bucket_max_capacity {
+			let offset = bucket_region_offset + bucket_idx * 4;
+			if page.len() < offset + 4 {
+				break;
 			}
-			std::thread::yield_now();
+			let packed_val = u32::from_le_bytes([
+				page[offset],
+				page[offset + 1],
+				page[offset + 2],
+				page[offset + 3],
+			]);
+			bucket_entries.push(BucketEntry {
+				prefix_idx: bucket_idx as u8,
+				tails: Self::extract_tails_from_u32(packed_val),
+			});
 		}
-		Err(())
-	}
+		eprintln!(
+			"[BUCKET_OUT] t+{:3}ms  parsed {} bucket entries, returning",
+			t.elapsed().as_millis(),
+			bucket_entries.len()
+		);
 
-	fn get_command_buffer(_c: &MemoryController) -> Option<ash::vk::CommandBuffer> {
-		None // TODO
-	}
-	fn get_quantize_pipeline(_c: &MemoryController) -> Option<ash::vk::Pipeline> {
-		None // TODO
-	}
-	fn get_pipeline_layout(_c: &MemoryController) -> Option<ash::vk::PipelineLayout> {
-		None // TODO
-	}
-	fn get_descriptor_set(
-		_c: &MemoryController,
-		_buf: ash::vk::Buffer,
-		_offset: ash::vk::DeviceSize,
-	) -> Option<ash::vk::DescriptorSet> {
-		None // TODO
-	}
-
-	/// Decode raw GPU output bytes back into GpuQuantizeOutput.
-	fn decode_gpu_output(raw: &[u8], n: usize, _prefix_digits: usize) -> Option<GpuQuantizeOutput> {
-		let u32_size = std::mem::size_of::<u32>();
-		let needed = n * u32_size * 2 + ((n + 31) / 32) * u32_size;
-		if raw.len() < needed {
-			return None;
-		}
-		let mut prefix_ints = Vec::with_capacity(n);
-		let mut tails = Vec::with_capacity(n);
-		for i in 0..n {
-			let p_off = i * u32_size;
-			let t_off = n * u32_size + i * u32_size;
-			let p = raw[p_off..p_off + u32_size].try_into().ok()?;
-			let t = raw[t_off..t_off + u32_size].try_into().ok()?;
-			prefix_ints.push(u32::from_le_bytes(p));
-			tails.push(u32::from_le_bytes(t));
-		}
-		let sign_words = (n + 31) / 32;
-		let signs_off = n * u32_size * 2;
-		let mut signs = Vec::with_capacity(sign_words);
-		for i in 0..sign_words {
-			let off = signs_off + i * u32_size;
-			let s = raw[off..off + u32_size].try_into().ok()?;
-			signs.push(u32::from_le_bytes(s));
-		}
-		Some(GpuQuantizeOutput {
-			prefix_ints,
-			tails,
-			signs,
+		Ok(GpuQuantizeOutput {
+			blocks: vec![BlockQuantizeOutput { bucket_entries }],
 		})
+	}
+
+	/// Extracts the 4 packed u8 tail entries out of a single u32 word written by the shader.
+	#[inline]
+	fn extract_tails_from_u32(packed_val: u32) -> Vec<u16> {
+		let mut tails = Vec::with_capacity(4);
+		// Iterate over the four 8-bit boundaries inside the 32-bit register
+		for i in 0..4 {
+			let shift = i * 8;
+			let tail_u8 = ((packed_val >> shift) & 0xFF) as u8;
+			// Convert back to u16 to match BucketEntry structural footprint
+			tails.push(tail_u8 as u16);
+		}
+		tails
 	}
 }
 

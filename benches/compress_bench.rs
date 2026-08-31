@@ -1,11 +1,11 @@
-// benches/compress_bench.rs
-//
-// Compression benchmarks only — no decompression, no error calculation.
-// Measures raw compression throughput.
+// compress_bench.rs
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use std::sync::{Arc, Mutex};
 
+use agent_harness::memory_controller::gpu_mem_op::init_gpu;
 use agent_harness::models::dedupe::tensor::DedupCountTensor;
+use agent_harness::models::dedupe::compressor::init_global_controller;
 
 /// Deterministic pseudo-random weights (LCG → Box-Muller → N(0, σ²)).
 /// σ=0.3 approximates typical transformer weight magnitudes.
@@ -41,155 +41,46 @@ fn make_weights(n: usize) -> Vec<f32> {
 
 fn bench_compress(c: &mut Criterion) {
 	let n = 1_000_000;
-	let prefix_digits = 2;
-	let truncate_rounds = 3;
 	let weights = make_weights(n);
 
-	let mut group = c.benchmark_group("compress");
+	// Unpack the entry into a named variable so its RAII lifetime keeps the library open
+	let (vulkan_entry, instance, physical_device, device, queue, allocator) = 
+		init_gpu().expect("Failed to boot Vulkan subsystem");
+
+	// Pass down the regular, expected reference to the instance
+	init_global_controller(
+		&instance,
+		physical_device,
+		device.clone(),
+		queue,
+		allocator,
+	).expect("Failed to spin up global memory controller");
+
+	let mut group = c.benchmark_group("quantization_ops");
+	
+	// ── RUN 1: Measure Data Bandwidth Throughput (GB/s) ──
+	let buffer_bytes = (n * std::mem::size_of::<f32>()) as u64;
+	group.throughput(Throughput::Bytes(buffer_bytes));
+	group.bench_function("gpu_quantize_1m_elements_bytes", |b| {
+		b.iter(|| {
+			let _output = DedupCountTensor::gpu_quantize(&weights, 2);
+		})
+	});
+
+	// ── RUN 2: Measure Processing Element Throughput (Elem/s) ──
 	group.throughput(Throughput::Elements(n as u64));
-	group.sample_size(50);
-
-	// ── Scalar percentile ────────────────────────────────────────────────
-	group.bench_function("scalar_percent", |b| {
+	group.bench_function("gpu_quantize_1m_elements_count", |b| {
 		b.iter(|| {
-			let (t, m) =
-				DedupCountTensor::compress_quantized(&weights, prefix_digits, truncate_rounds);
-			criterion::black_box((&t, &m));
-		});
+			let _output = DedupCountTensor::gpu_quantize(&weights, 2);
+		})
 	});
-
-	// ── Scalar KL ────────────────────────────────────────────────────────
-	group.bench_function("scalar_kl", |b| {
-		b.iter(|| {
-			let (t, m) =
-				DedupCountTensor::compress_quantized_kl(&weights, prefix_digits, truncate_rounds);
-			criterion::black_box((&t, &m));
-		});
-	});
-
-	// ── AVX-512 percentile ───────────────────────────────────────────────
-	group.bench_function("avx512_percent", |b| {
-		b.iter(|| {
-			let (t, m) =
-				DedupCountTensor::compress_avx512_percent(&weights, prefix_digits, truncate_rounds);
-			criterion::black_box((&t, &m));
-		});
-	});
-
-	// ── AVX-512 KL ───────────────────────────────────────────────────────
-	group.bench_function("avx512_kl", |b| {
-		b.iter(|| {
-			let (t, m) =
-				DedupCountTensor::compress_avx512_kl(&weights, prefix_digits, truncate_rounds);
-			criterion::black_box((&t, &m));
-		});
-	});
-
-	// GPU pre-compute (shared by all GPU paths) — ONCE before all GPU benchmarks
-	// Uses the new GPU shader-based quantization via memory_controller
-	// Wrapped in a catch-unwind + signal handler to avoid crashing the benchmark
-	let gpu_out = agent_harness::memory_controller::gpu_mem_op::try_gpu_quantize(&weights, prefix_digits);
-
-	if let Some(gpu_out) = &gpu_out {
-		let prefix_ints = gpu_out.prefix_ints.clone();
-		let tails = gpu_out.tails.clone();
-		let signs = gpu_out.signs.clone();
-
-		// ── GPU pure percentile ────────────────────────────────────────────
-		group.bench_function("gpu_pure_percent", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_percent(
-					&gpu_out.prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-
-		// ── GPU pure KL ────────────────────────────────────────────────────
-		group.bench_function("gpu_pure_kl", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_kl(
-					&gpu_out.prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-
-		// ── GPU + AVX512 tails percentile ──────────────────────────────────
-		group.bench_function("gpu_avx512_tails_percent", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_percent(
-					&prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-
-		// ── GPU + AVX512 tails KL ──────────────────────────────────────────
-		group.bench_function("gpu_avx512_tails_kl", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_kl(
-					&prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-
-		// ── GPU + scalar tails percentile ──────────────────────────────────
-		group.bench_function("gpu_scalar_tails_percent", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_scalar_percent(
-					&prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-
-		// ── GPU + scalar tails KL ──────────────────────────────────────────
-		group.bench_function("gpu_scalar_tails_kl", |b| {
-			b.iter(|| {
-				let (t, m) = DedupCountTensor::compress_from_gpu_scalar_kl(
-					&prefix_ints,
-					&tails,
-					&signs,
-					prefix_digits,
-					truncate_rounds,
-				);
-				criterion::black_box((&t, &m));
-			});
-		});
-	} else {
-		eprintln!("compress_bench: no GPU adapter available — skipping GPU benches.");
-	}
-
-	if !is_x86_feature_detected!("avx512f") {
-		eprintln!(
-			"compress_bench: AVX-512 not supported on this CPU — avx512 methods fall back to scalar internally."
-		);
-	}
 
 	group.finish();
+
+	// Explicitly preserve the instance to guarantee the compiler does not
+	// optimize it away or drop it early during execution of the benchmark loop.
+	std::mem::drop(instance);
 }
 
-criterion_group!(compress_benches, bench_compress);
-criterion_main!(compress_benches);
+criterion_group!(benches, bench_compress);
+criterion_main!(benches);
