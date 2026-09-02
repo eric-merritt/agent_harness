@@ -1,9 +1,7 @@
 pub mod adapters;
 pub mod avx512_kernel;
 pub mod convert;
-pub mod dedupe;
+pub mod compression;
 pub mod formats;
-pub mod indexed;
-pub mod packed;
 pub mod quantization;
 pub mod server;

@@ -1,28 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// ── Graph types ────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Edge {
-	pub id: Uuid,
-	pub nodes: Vec<Node>,
-	pub relationship: String,
-}
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Node {
-	pub id: Uuid,
-	pub name: String,
-	pub edges: Vec<Uuid>,
-}
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Graph {
-	pub id: Uuid,
-	pub nodes: Vec<Node>,
-	pub edges: Vec<Edge>,
-}
 
 impl Graph {
 	pub fn new(id: Uuid, nodes: Vec<Node>, edges: Vec<Edge>) -> Self {

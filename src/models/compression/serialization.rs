@@ -1,4 +1,4 @@
-use crate::models::dedupe::types::Sandbag;
+use crate::models::formats::sandbag::Sandbag;
 use std::convert::TryInto;
 
 /// Binary file layout (little-endian, no padding):
@@ -15,11 +15,11 @@ use std::convert::TryInto;
 ///  │  [A] count: u32                                              │
 ///  │  [B] scale: f32                                              │
 ///  │  [C] prefix_digits: u32                                      │
-///  │  [D] outliers: u32(count) × [u32(pos) + f32(val)]            │
+///  │  [D] meta_tensors: u32(count) × [u32(pos) + f32(val)]            │
 ///  │  [E] unique_prefixes: u32(count) × [u8]                      │
 ///  │  [F] unique_tails: u32(count) × [u32]                        │
-///  │  [G] manifest: u32(count) × [u16(p_idx) + u16(t_idx)]       │
-///  │  [H] signs: u32(bytes) × [u8] (bitvector, 1 bit per element) │
+///  │  [G] index_signs: u32(count) × [u16(p_idx) + u16(t_idx)]       │
+///  │  [H] size: u32(bytes) × [u8] (bitvector, 1 bit per element) │
 /// └──────────────────────────────────────────────────────────────┘
 ///
 /// Sections are NOT offset-indexed — you must scan sequentially.
@@ -30,20 +30,22 @@ const VERSION_MINOR: u8 = 3;
 
 impl Sandbag {
 	pub fn estimated_size(&self) -> usize {
+		let (dim_a, dim_b) = ((self.size.0 as u32 >> 32) as usize, (self.size.0 as u32) as usize);
+		let total_bytes = dim_a * dim_b;
 		8 // header
         + 4 // count
         + 4 // scale
         + 4 // prefix_digits
         + 4 // outlier_count
-        + self.outliers.len() * 8
+        + self.meta_tensors.len() * 8
         + 4 // unique_prefixes count
         + self.unique_prefixes.len() // u8 each
         + 4 // unique_tails count
         + self.unique_tails.len() * 4 // u32 each
-        + 4 // manifest count
-        + self.manifest.len() * 4 // u16 + u16
-        + 4 // signs byte count
-        + self.signs.len()
+        + 4 // index_signs count
+        + self.index_signs.len() * 4 // u16 + u16
+        + 4 // size byte count
+        + total_bytes * 4
 	}
 
 	pub fn to_bytes(&self) -> Vec<u8> {
@@ -59,14 +61,14 @@ impl Sandbag {
 		bytes.extend_from_slice(&(self.count as u32).to_le_bytes());
 
 		// [B] scale
-		bytes.extend_from_slice(&self.scale.to_le_bytes());
+		bytes.extend_from_slice(&self.size.to_le_bytes());
 
 		// [C] prefix_digits
 		bytes.extend_from_slice(&(self.prefix_digits as u32).to_le_bytes());
 
-		// [D] outliers
-		bytes.extend_from_slice(&(self.outliers.len() as u32).to_le_bytes());
-		for &(idx, val) in &self.outliers {
+		// [D] meta_tensors
+		bytes.extend_from_slice(&(self.meta_tensors.len() as u32).to_le_bytes());
+		for &(idx, val) in &self.meta_tensors {
 			bytes.extend_from_slice(&(idx as u32).to_le_bytes());
 			bytes.extend_from_slice(&val.to_le_bytes());
 		}
@@ -81,16 +83,16 @@ impl Sandbag {
 			bytes.extend_from_slice(&v.to_le_bytes());
 		}
 
-		// [G] manifest (u16 p_idx + u16 t_idx per entry)
-		bytes.extend_from_slice(&(self.manifest.len() as u32).to_le_bytes());
-		for &(p_idx, t_idx) in &self.manifest {
+		// [G] index_signs (u16 p_idx + u16 t_idx per entry)
+		bytes.extend_from_slice(&(self.index_signs.len() as u32).to_le_bytes());
+		for &(p_idx, t_idx) in &self.index_signs {
 			bytes.extend_from_slice(&p_idx.to_le_bytes());
 			bytes.extend_from_slice(&t_idx.to_le_bytes());
 		}
 
-		// [H] signs bitvector
-		bytes.extend_from_slice(&(self.signs.len() as u32).to_le_bytes());
-		bytes.extend_from_slice(&self.signs);
+		// [H] size bitvector
+		bytes.extend_from_slice(&(self.size.len() as u32).to_le_bytes());
+		bytes.extend_from_slice(&self.size);
 
 		bytes
 	}
@@ -132,18 +134,18 @@ impl Sandbag {
 		read(&mut buf4, 4, data, &mut pos)?;
 		let prefix_digits = u32::from_le_bytes(buf4) as usize;
 
-		// [D] outliers
+		// [D] meta_tensors
 		read(&mut buf4, 4, data, &mut pos)?;
 		let outlier_count = u32::from_le_bytes(buf4) as usize;
 		let outliers_byte_len = outlier_count * 8;
 		let outliers_data = data.get(pos..pos + outliers_byte_len)?;
 		pos += outliers_byte_len;
 
-		let mut outliers = Vec::with_capacity(outlier_count);
+		let mut meta_tensors = Vec::with_capacity(outlier_count);
 		for chunk in outliers_data.chunks_exact(8) {
 			let idx = u32::from_le_bytes(chunk[0..4].try_into().ok()?) as usize;
 			let val = f32::from_le_bytes(chunk[4..8].try_into().ok()?);
-			outliers.push((idx, val));
+			meta_tensors.push((idx, val));
 		}
 
 		// [E] unique_prefixes (u8 each)
@@ -165,36 +167,35 @@ impl Sandbag {
 			unique_tails.push(u32::from_le_bytes(chunk.try_into().ok()?));
 		}
 
-		// [G] manifest (u16 p_idx + u16 t_idx per entry)
+		// [G] index_signs (u16 p_idx + u16 t_idx per entry)
 		read(&mut buf4, 4, data, &mut pos)?;
 		let manifest_count = u32::from_le_bytes(buf4) as usize;
 		let manifest_byte_len = manifest_count * 4;
 		let manifest_data = data.get(pos..pos + manifest_byte_len)?;
 		pos += manifest_byte_len;
 
-		let mut manifest = Vec::with_capacity(manifest_count);
+		let mut index_signs = Vec::with_capacity(manifest_count);
 		for chunk in manifest_data.chunks_exact(4) {
 			let p_idx = u16::from_le_bytes(chunk[0..2].try_into().ok()?);
 			let t_idx = u16::from_le_bytes(chunk[2..4].try_into().ok()?);
-			manifest.push((p_idx, t_idx));
+			index_signs.push((p_idx, t_idx));
 		}
 
-		// [H] signs bitvector
+		// [H] size bitvector
 		read(&mut buf4, 4, data, &mut pos)?;
 		let signs_len = u32::from_le_bytes(buf4) as usize;
 		let signs_data = data.get(pos..pos + signs_len)?;
 		pos += signs_len;
-		let signs: Vec<u8> = signs_data.to_vec();
+		let size: Vec<u8> = signs_data.to_vec();
 
 		Some(Self {
-			scale,
-			outliers,
+			size,
+			meta_tensors,
 			count,
 			prefix_digits,
 			unique_prefixes,
 			unique_tails,
-			manifest,
-			signs,
+			index_signs,
 		})
 	}
 }
@@ -207,13 +208,13 @@ mod tests {
 	fn test_sandbag_roundtrip() {
 		let sb = Sandbag {
 			scale: 0.00012345f32,
-			outliers: vec![(100, 1.5f32), (200, -0.7f32)],
+			meta_tensors: vec![(100, 1.5f32), (200, -0.7f32)],
 			count: 7,
 			prefix_digits: 2,
 			unique_prefixes: vec![27u8, 27u8],
 			unique_tails: vec![9453000u32, 100000u32],
-			manifest: vec![(0u16, 0u16), (1u16, 1u16), (0u16, 0u16)],
-			signs: vec![0b00000101u8, 0u8], // bits 0,2 negative
+			index_signs: vec![(0u16, 0u16), (1u16, 1u16), (0u16, 0u16)],
+			size: vec![0b00000101u8, 0u8], // bits 0,2 negative
 		};
 
 		let bytes = sb.to_bytes();
@@ -228,46 +229,46 @@ mod tests {
 			sb2.prefix_digits, sb.prefix_digits,
 			"prefix_digits mismatch"
 		);
-		assert_eq!(sb2.outliers, sb.outliers, "outliers mismatch");
+		assert_eq!(sb2.meta_tensors, sb.meta_tensors, "meta_tensors mismatch");
 		assert_eq!(
 			sb2.unique_prefixes, sb.unique_prefixes,
 			"unique_prefixes mismatch"
 		);
 		assert_eq!(sb2.unique_tails, sb.unique_tails, "unique_tails mismatch");
-		assert_eq!(sb2.manifest, sb.manifest, "manifest mismatch");
-		assert_eq!(sb2.signs, sb.signs, "signs mismatch");
+		assert_eq!(sb2.index_signs, sb.index_signs, "index_signs mismatch");
+		assert_eq!(sb2.size, sb.size, "size mismatch");
 	}
 
 	#[test]
 	fn test_sandbag_empty() {
 		let sb = Sandbag {
 			scale: 1.0,
-			outliers: vec![],
+			meta_tensors: vec![],
 			count: 0,
 			prefix_digits: 2,
 			unique_prefixes: vec![],
 			unique_tails: vec![],
-			manifest: vec![],
-			signs: vec![],
+			index_signs: vec![],
+			size: vec![],
 		};
 		let bytes = sb.to_bytes();
 		let sb2 = Sandbag::from_bytes(&bytes).expect("empty roundtrip failed");
 		assert_eq!(sb2.count, 0);
 		assert_eq!(sb2.unique_prefixes.len(), 0);
-		assert_eq!(sb2.manifest.len(), 0);
+		assert_eq!(sb2.index_signs.len(), 0);
 	}
 
 	#[test]
 	fn test_bad_magic_rejected() {
 		let mut bytes = Sandbag {
 			scale: 1.0,
-			outliers: vec![],
+			meta_tensors: vec![],
 			count: 0,
 			prefix_digits: 2,
 			unique_prefixes: vec![],
 			unique_tails: vec![],
-			manifest: vec![],
-			signs: vec![],
+			index_signs: vec![],
+			size: vec![],
 		}
 		.to_bytes();
 		bytes[0] = 0;
@@ -281,13 +282,13 @@ mod tests {
 	fn test_major_version_mismatch() {
 		let mut bytes = Sandbag {
 			scale: 1.0,
-			outliers: vec![],
+			meta_tensors: vec![],
 			count: 0,
 			prefix_digits: 2,
 			unique_prefixes: vec![],
 			unique_tails: vec![],
-			manifest: vec![],
-			signs: vec![],
+			index_signs: vec![],
+			size: vec![],
 		}
 		.to_bytes();
 		bytes[4] = 1;

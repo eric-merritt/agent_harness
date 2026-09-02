@@ -1,53 +1,18 @@
-use crate::memory_controller::controller::MemoryController;
+use crate::memory_controller::controller::{MemoryController,GLOBAL_CONTROLLER};
 use crate::models::convert::common::{CompressOutput, CHUNK_SIZE};
 use crate::models::convert::core::serialize_core;
-use crate::models::dedupe::tensor::DedupCountTensor;
-use crate::models::dedupe::truncation::{quantize_block, quantize_block_avx512, quantize_block_kl};
-use crate::models::dedupe::types::Sandbag;
+use crate::models::compression::tensor::DedupCountTensor;
+use crate::models::compression::truncation::{quantize_block, quantize_block_avx512, quantize_block_kl};
+use crate::models::formats::sandbag::Sandbag;
+use crate::models::compression::gpu_helpers::WorkPoolEntry;
 use crate::models::quantization::QuantizationLevels;
+use crate::models::formats::sandbag::{BlockSizeBuffer,BucketEntry};
 
 use ash::vk;
 use hashbrown::HashMap as AHashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Global MemoryController — initialized once by init_global_controller().
-static GLOBAL_CONTROLLER: OnceLock<Arc<Mutex<MemoryController>>> = OnceLock::new();
 
-/// GPU buffer layout matching TensorArenaArchitecture.pdf spec.
-///
-/// Memory layout (contiguous, in order):
-///   1. ModelSize          — 4 bytes  (u32: total block count)
-///   2. GPUWorkPool        — blocks × 4 bytes  (u32 per block, bits 30/31 are status)
-///   3. BlockSizeBuffer    — blocks × 4 bytes  (u32: high16=width, low16=height)
-///   4. BlockData          — blocks × block_size × 4 bytes  (f32 weights)
-///   5. Buckets            — blocks × bucket_region_size
-///
-/// Per-block bucket region: 100 bucket entries.
-/// Each bucket: u8 prefix_index + u16[BlockSize/100] tail_indices.
-
-/// Initialize the global MemoryController from Vulkan hardware.
-/// Must be called once before any gpu_quantize() calls.
-/// Returns true if initialized, false if already initialized.
-pub fn init_global_controller(
-	instance: &ash::Instance,
-	physical_device: ash::vk::PhysicalDevice,
-	device: ash::Device,
-	queue: ash::vk::Queue,
-	allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
-) -> Result<(), String> {
-	let ctrl = unsafe {
-		MemoryController::initialize_controller_from_hardware(
-			instance,
-			physical_device,
-			device,
-			queue,
-			allocator,
-		)
-	};
-	GLOBAL_CONTROLLER
-		.set(Arc::new(Mutex::new(ctrl)))
-		.map_err(|_| "Global controller already initialized".to_string())
-}
 
 /// Wrapper to make raw pointers Send + Sync for rayon parallel iteration.
 /// All access goes through methods so the raw pointer never escapes the wrapper.
@@ -69,75 +34,23 @@ impl<T> SafePtr<T> {
 	}
 }
 
-/// Single bucket entry written by the shader.
-/// `prefix_idx` is the u8 deduplicated prefix index.
-/// `tails` holds `block_size / 100` u16 tail indices for that bucket.
-#[repr(C, align(4))]
-pub struct BucketEntry {
-	pub prefix_idx: u8,
-	/// Length = block_size / 100 (rounded up). Each u16 is a tail index.
-	pub tails: Vec<u16>,
-}
 
-/// Packed block dimensions: high 16 bits = width, low 16 bits = height.
-#[repr(transparent)]
-#[derive(Clone, Copy, Default)]
-pub struct BlockSizeU32(pub u32);
 
-impl BlockSizeU32 {
-	pub fn new(width: u16, height: u16) -> Self {
-		Self((u32::from(width) << 16) | u32::from(height))
-	}
-	pub fn width(&self) -> u16 {
-		(self.0 >> 16) as u16
-	}
-	pub fn height(&self) -> u16 {
-		(self.0 & 0xFFFF) as u16
-	}
-	/// Total elements in this block (width × height).
-	pub fn block_size(&self) -> usize {
-		(self.width() as usize) * (self.height() as usize)
-	}
-}
 
-/// Work-pool entry: bits 0–29 = block index, bit 30 = done, bit 31 = claimed.
-#[derive(Clone, Copy, Default)]
-pub struct WorkPoolEntry(u32);
 
-impl WorkPoolEntry {
-	pub const DONE_BIT: u32 = 1 << 30;
-	pub const CLAIM_BIT: u32 = 1 << 31;
-	pub const INDEX_MASK: u32 = 0x3FFFFFF; // bits 0–29
 
-	pub fn new(block_index: u32) -> Self {
-		Self(block_index & Self::INDEX_MASK)
-	}
-	pub fn block_index(&self) -> u32 {
-		self.0 & Self::INDEX_MASK
-	}
-	pub fn is_claimed(&self) -> bool {
-		(self.0 & Self::CLAIM_BIT) != 0
-	}
-	pub fn is_done(&self) -> bool {
-		(self.0 & Self::DONE_BIT) != 0
-	}
-	pub fn claim(&mut self) {
-		self.0 |= Self::CLAIM_BIT;
-	}
-	pub fn mark_done(&mut self) {
-		self.0 |= Self::DONE_BIT;
-	}
-	pub fn reset(&mut self) {
-		self.0 = 0;
-	}
-}
 
-/// One block's quantized output read back from the bucket region.
+/// Full GPU quantization result: one BlockQuantizeOutput per block.
 pub struct BlockQuantizeOutput {
 	pub bucket_entries: Vec<BucketEntry>,
 }
 
-/// Full GPU quantization result: one BlockQuantizeOutput per block.
+impl BlockQuantizeOutput {
+	pub fn bucket_entries(&self) -> &Vec<BucketEntry> {
+		&self.bucket_entries
+	}
+}
+
 pub struct GpuQuantizeOutput {
 	pub blocks: Vec<BlockQuantizeOutput>,
 }
@@ -150,11 +63,11 @@ impl GpuQuantizeOutput {
 			.iter()
 			.map(|block| {
 				block
-					.bucket_entries
+					.bucket_entries()
 					.iter()
 					.rev()
-					.find(|e| !e.tails.is_empty())
-					.and_then(|e| e.tails.last().copied())
+					.find(|e| e.tails != [0u16; 4])
+					.and_then(|e| e.tails.iter().find(|&&t| t != 0).copied())
 			})
 			.collect()
 	}
@@ -230,7 +143,7 @@ impl DedupCountTensor {
 		Some(c.gpu.cached_descriptor_set)
 	}
 
-	// Quantize-based compression (fast path): i16 per weight with dedup.
+	// Quantize-based compression (fast path): i16 per weight with compression.
 	pub fn compress_quantized(
 		weights: &[f32],
 		prefix_digits: usize,
@@ -321,7 +234,7 @@ impl DedupCountTensor {
 		page_image[4..8].copy_from_slice(&wp_entry.0.to_le_bytes());
 
 		// Write block_size (width = n, height = 1)
-		let bs = BlockSizeU32::new(n as u16, 1);
+		let bs = BlockSizeBuffer::new(n as u16, 1);
 		page_image[8..12].copy_from_slice(&bs.0.to_le_bytes());
 
 		// Write weight data as f32 little-endian
@@ -409,7 +322,7 @@ impl DedupCountTensor {
 		let mut manifest = Vec::with_capacity(n);
 		let mut signs: Vec<u8> = vec![0u8; (n + 7) / 8];
 
-		// Accumulators for precision loss (computed in the same pass as dedup)
+		// Accumulators for precision loss (computed in the same pass as compression)
 		let mut loss_sum = 0.0f32;
 		let mut loss_count = 0usize;
 		let mut max_abs_err = 0.0f32;
@@ -477,10 +390,10 @@ impl DedupCountTensor {
 		}
 
 		// Build UniqueTail list for tensor
-		let ut: Vec<crate::models::dedupe::types::UniqueTail> = unique_tails
+		let ut: Vec<crate::models::formats::sandbag::UniqueTail> = unique_tails
 			.iter()
 			.enumerate()
-			.map(|(i, &v)| crate::models::dedupe::types::UniqueTail {
+			.map(|(i, &v)| crate::models::formats::sandbag::UniqueTail {
 				value: v,
 				repeat_count: *tail_counts.entry(i as u16).or_insert(0),
 			})
@@ -522,7 +435,7 @@ impl DedupCountTensor {
 		Self::compress_quantized_avx512(weights, prefix_digits, truncate_rounds)
 	}
 
-	/// Pure-GPU CPU dedup path — reconstruct f32 weights from GPU output, then quantize (percentile).
+	/// Pure-GPU CPU compression path — reconstruct f32 weights from GPU output, then quantize (percentile).
 	/// Uses AVX-512 for reconstruction when available.
 	///
 	/// TODO: rewrite reconstruction to read from bucket_entries instead of flat arrays.
@@ -569,7 +482,7 @@ impl DedupCountTensor {
 		Self::compress_quantized(&weights, prefix_digits, _truncate_rounds)
 	}
 
-	/// Pure-GPU CPU dedup path — scalar reconstruction only (no AVX-512), then quantize (percentile).
+	/// Pure-GPU CPU compression path — scalar reconstruction only (no AVX-512), then quantize (percentile).
 	pub fn compress_from_gpu_scalar_percent(
 		prefix_ints: &[u32],
 		tails: &[u32],
@@ -679,7 +592,7 @@ impl DedupCountTensor {
 		Self::compress_quantized_kl_avx512(weights, prefix_digits, truncate_rounds)
 	}
 
-	/// Pure-GPU CPU dedup — KL divergence quantization.
+	/// Pure-GPU CPU compression — KL divergence quantization.
 	/// Uses AVX-512 for reconstruction when available.
 	pub fn compress_from_gpu_kl(
 		prefix_ints: &[u32],
@@ -720,7 +633,7 @@ impl DedupCountTensor {
 		Self::compress_quantized_kl(&weights, prefix_digits, _truncate_rounds)
 	}
 
-	/// Pure-GPU CPU dedup — KL divergence quantization, scalar reconstruction only.
+	/// Pure-GPU CPU compression — KL divergence quantization, scalar reconstruction only.
 	pub fn compress_from_gpu_scalar_kl(
 		prefix_ints: &[u32],
 		tails: &[u32],
@@ -876,7 +789,7 @@ impl DedupCountTensor {
 			};
 		}
 
-		// ToNeg4 / ToNeg8: quantize + dedup
+		// ToNeg4 / ToNeg8: quantize + compression
 		if weights.len() > CHUNK_SIZE {
 			let n_chunks = (weights.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
 			let mut core = Vec::new();
@@ -952,17 +865,15 @@ impl DedupCountTensor {
         total_elements: u32,
         prefix_digits: u32,
     ) -> Result<(GpuQuantizeOutput, vk::Fence, ash::Device), String> {
+        use crate::memory_controller::controller::GpuContext;
         let device = &ctrl.gpu.device_handle;
 
-        // 1. Allocate command buffer from the persistent pool
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(ctrl.gpu.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        
-        let cmd_buffer = device
-            .allocate_command_buffers(&alloc_info)
-            .map_err(|e| format!("Failed to allocate command buffer: {:?}", e))?[0];
+        // 1. Get command buffer from pool (recycled or fresh)
+        let cmd_buffer = GpuContext::alloc_cmd_buffer(
+            device,
+            ctrl.gpu.command_pool,
+            &ctrl.gpu.cmd_buffer_pool,
+        );
 
         // 2. Begin command buffer recording
         device
@@ -1010,10 +921,8 @@ impl DedupCountTensor {
             .end_command_buffer(cmd_buffer)
             .map_err(|e| format!("Failed to end command buffer: {:?}", e))?;
 
-        // 7. Create timeline tracking fence to pass back up to the benchmark host
-        let fence = device
-            .create_fence(&vk::FenceCreateInfo::default(), None)
-            .map_err(|e| format!("Failed to create execution fence: {:?}", e))?;
+        // 7. Get fence from pool (recycled or fresh)
+        let fence = GpuContext::alloc_fence(device, &ctrl.gpu.fence_pool);
 
         // 8. Submit raw command stream payload to the hardware queues
         let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buffer));
@@ -1106,16 +1015,13 @@ impl DedupCountTensor {
 
 	/// Extracts the 4 packed u8 tail entries out of a single u32 word written by the shader.
 	#[inline]
-	fn extract_tails_from_u32(packed_val: u32) -> Vec<u16> {
-		let mut tails = Vec::with_capacity(4);
-		// Iterate over the four 8-bit boundaries inside the 32-bit register
-		for i in 0..4 {
-			let shift = i * 8;
-			let tail_u8 = ((packed_val >> shift) & 0xFF) as u8;
-			// Convert back to u16 to match BucketEntry structural footprint
-			tails.push(tail_u8 as u16);
-		}
-		tails
+	fn extract_tails_from_u32(packed_val: u32) -> [u16; 4] {
+		[
+			((packed_val >> 0) & 0xFF) as u16,
+			((packed_val >> 8) & 0xFF) as u16,
+			((packed_val >> 16) & 0xFF) as u16,
+			((packed_val >> 24) & 0xFF) as u16,
+		]
 	}
 }
 
@@ -1172,7 +1078,7 @@ mod roundtrip_tests {
 		// Serialize → deserialize → decompress (verify round-trip through wire format)
 		let bytes = sandbag.to_bytes();
 		eprintln!("serialized sandbag: {} bytes", bytes.len());
-		let sandbag2 = crate::models::dedupe::types::Sandbag::from_bytes(&bytes)
+		let sandbag2 = crate::models::formats::sandbag::from_bytes(&bytes)
 			.expect("deserialization failed");
 		let recon = tensor.decompress_all(&sandbag2);
 

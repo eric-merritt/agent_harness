@@ -1,4 +1,4 @@
-use crate::models::dedupe::types::UniqueTail;
+use crate::models::formats::sandbag::{Sandbag, UniqueTail};
 
 #[derive(Clone, Debug)]
 pub struct DedupCountTensor {

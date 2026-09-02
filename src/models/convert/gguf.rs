@@ -12,7 +12,7 @@ use std::thread;
 
 use super::common::{CHUNK_SIZE, CompressJob, CompressResult, resolve_params};
 
-use super::super::dedupe::tensor::DedupCountTensor;
+use super::super::compression::tensor::DedupCountTensor;
 
 use super::super::formats::gguf::{GGUFFile, quant_block_info};
 

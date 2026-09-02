@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use crate::models::convert::core::deserialize_core_chunks;
 use crate::models::convert::loader::ModelLoader;
-use crate::models::dedupe::tensor::DedupCountTensor;
-use crate::models::dedupe::types::GlobalTable;
+use crate::models::compression::tensor::DedupCountTensor;
+use crate::models::formats::sandbag::GlobalTable;
 use config::ModelConfig;
 use tokenizer::Tokenizer;
 

@@ -7,9 +7,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use super::super::dedupe::tensor::DedupCountTensor;
+use super::super::compression::tensor::DedupCountTensor;
 use super::super::formats::safetensors::{SafetensorsDtype, SafetensorsHeader};
 use super::common::{CompressJob, CompressResult, ConversionStats, TensorStats, resolve_params};
+
+
+
+/// Compressed representation of a weight block.
+///
+/// Values are split into prefix_int + tail_int (matching GPU/AVX shader math):
+///   prefix_int = floor(abs_w * 10^prefix_digits)
+///   tail_int   = round((abs_w - prefix_int/10^prefix_digits) * 10^7)
+///
+/// Reconstruction:
+///   abs_w = (prefix_int as f32) / 10^prefix_digits + (tail_int as f32) / 10^7
+///   w = if sign_bit_set { -abs_w } else { abs_w }
+///
+/// Outliers stored at full precision.
+
+
+
 
 pub fn normalize_tensor_name(name: &str) -> String {
 	if name == "model.embed_tokens.weight" || name == "embed_tokens.weight" {

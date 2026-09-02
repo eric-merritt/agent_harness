@@ -25,6 +25,7 @@ impl Write for AutoFlushFile {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 
+
 	    // Tell Cargo to rerun this script if the shader changes
     println!("cargo:rerun-if-changed=src/models/dedupe/quantize_gemv.comp");
 

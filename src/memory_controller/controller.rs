@@ -2,10 +2,9 @@ use crate::memory_controller::{
 	cpu_mem_op::CpuMemory,
 	virtual_tensor_arena::{OperationType, PageResidency, VirtualTensorArena},
 };
-
 use ash::vk;
 use gpu_allocator::vulkan::Allocator;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
 
 /// A block of model data to be paged into the arena.
@@ -25,6 +24,10 @@ pub struct GpuContext {
 	pub queue_family: u32,
 	pub allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
 	pub command_pool: vk::CommandPool,
+	/// Pooled command buffers — recycled via resetCommandBuffers instead of re-allocated.
+	pub cmd_buffer_pool: std::sync::Mutex<Vec<vk::CommandBuffer>>,
+	/// Pooled fences — recycled via resetFences instead of create/destroy.
+	pub fence_pool: std::sync::Mutex<Vec<vk::Fence>>,
 	/// Cached quantization compute pipeline (compiled from quantize_gemv.spv).
 	pub cached_quantize_pipeline: vk::Pipeline,
 	/// Cached pipeline layout (push constants + descriptor set).
@@ -58,6 +61,8 @@ impl GpuContext {
 			queue_family,
 			allocator,
 			command_pool,
+			cmd_buffer_pool: std::sync::Mutex::new(Vec::new()),
+			fence_pool: std::sync::Mutex::new(Vec::new()),
 			cached_quantize_pipeline,
 			cached_pipeline_layout,
 			cached_descriptor_set_layout,
@@ -75,6 +80,8 @@ impl GpuContext {
 			queue_family: self.queue_family,
 			allocator: Arc::clone(&self.allocator),
 			command_pool: self.command_pool,
+			cmd_buffer_pool: std::sync::Mutex::new(Vec::new()),
+			fence_pool: std::sync::Mutex::new(Vec::new()),
 			cached_quantize_pipeline: self.cached_quantize_pipeline,
 			cached_pipeline_layout: self.cached_pipeline_layout,
 			cached_descriptor_set_layout: self.cached_descriptor_set_layout,
@@ -90,6 +97,66 @@ impl GpuContext {
 	}
 	pub fn allocator(&self) -> Arc<Mutex<gpu_allocator::vulkan::Allocator>> {
 		Arc::clone(&self.allocator)
+	}
+
+	// ── Command-buffer / fence pool helpers ──
+
+	/// Pop a recycled command buffer from the pool, or allocate a fresh one.
+	pub fn alloc_cmd_buffer(
+		device: &ash::Device,
+		pool: vk::CommandPool,
+		pooled: &std::sync::Mutex<Vec<vk::CommandBuffer>>,
+	) -> vk::CommandBuffer {
+		let mut guard = pooled.lock().unwrap();
+		let cmd = guard.pop().unwrap_or_else(|| {
+			drop(guard);
+			let alloc_info = vk::CommandBufferAllocateInfo::default()
+				.command_pool(pool)
+				.level(vk::CommandBufferLevel::PRIMARY)
+				.command_buffer_count(1);
+			unsafe {
+				device
+					.allocate_command_buffers(&alloc_info)
+					.expect("allocate command buffer")[0]
+			}
+		});
+		cmd
+	}
+
+	/// Pop a recycled fence from the pool, or create a fresh one.
+	pub fn alloc_fence(
+		device: &ash::Device,
+		pooled: &std::sync::Mutex<Vec<vk::Fence>>,
+	) -> vk::Fence {
+		let mut guard = pooled.lock().unwrap();
+		guard.pop().unwrap_or_else(|| {
+			drop(guard);
+			unsafe {
+				device
+					.create_fence(&vk::FenceCreateInfo::default(), None)
+					.expect("create fence")
+			}
+		})
+	}
+
+	/// Recycle a waited-on fence: reset and push back into the pool.
+	pub fn recycle_fence(
+		device: &ash::Device,
+		fence: vk::Fence,
+		pooled: &std::sync::Mutex<Vec<vk::Fence>>,
+	) {
+		unsafe { device.reset_fences(&[fence]).expect("reset fence for pool"); }
+		pooled.lock().unwrap().push(fence);
+	}
+
+	/// Recycle an executed command buffer: reset and push back into the pool.
+	pub fn recycle_cmd_buffer(
+		device: &ash::Device,
+		cmd: vk::CommandBuffer,
+		pooled: &std::sync::Mutex<Vec<vk::CommandBuffer>>,
+	) {
+		unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()); }
+		pooled.lock().unwrap().push(cmd);
 	}
 
 	/// Synchronous upload: copy `data` into `buf` at `offset` via a staging buffer.
@@ -175,22 +242,9 @@ impl GpuContext {
 				.queue_wait_idle(self.queue_handle)
 				.expect("queue_wait_idle before cmd alloc");
 		}
-		eprintln!("[UPLOAD] t+{:3}ms  queue idle, allocating command buffer...", t.elapsed().as_millis());
+		eprintln!("[UPLOAD] t+{:3}ms  queue idle, getting command buffer...", t.elapsed().as_millis());
 
-		let alloc_info = vk::CommandBufferAllocateInfo::default()
-			.command_pool(self.command_pool)
-			.level(vk::CommandBufferLevel::PRIMARY)
-			.command_buffer_count(1);
-		eprintln!("[UPLOAD]    alloc_info built, calling allocate_command_buffers...");
-		let cmd_result = unsafe {
-			self.device_handle.allocate_command_buffers(&alloc_info)
-		};
-		let desc = match &cmd_result { Ok(v) => format!("{} buffers", v.len()), Err(_) => "ERR".to_string() };
-		eprintln!("[UPLOAD]    allocate_command_buffers returned: {}", desc);
-		let cmd = match cmd_result {
-			Ok(cmds) => cmds[0],
-			Err(e) => panic!("[UPLOAD] allocate_command_buffers failed: {:?}", e),
-		};
+		let cmd = Self::alloc_cmd_buffer(&self.device_handle, self.command_pool, &self.cmd_buffer_pool);
 		unsafe {
 			self.device_handle
 				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
@@ -214,11 +268,7 @@ impl GpuContext {
 			"[UPLOAD] t+{:3}ms  creating fence + submitting...",
 			t.elapsed().as_millis()
 		);
-		let fence = unsafe {
-			self.device_handle
-				.create_fence(&vk::FenceCreateInfo::default(), None)
-				.expect("create fence")
-		};
+		let fence = Self::alloc_fence(&self.device_handle, &self.fence_pool);
 		unsafe {
 			self.device_handle
 				.queue_submit(
@@ -240,11 +290,11 @@ impl GpuContext {
 			);
 		}
 
-		// 6. Cleanup
+		// 6. Cleanup — recycle cmd buffer + fence back to pools
 		unsafe {
-			self.device_handle.destroy_fence(fence, None);
-			self.device_handle
-				.free_command_buffers(self.command_pool, &[cmd]);
+			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
+			self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			self.cmd_buffer_pool.lock().unwrap().push(cmd);
 			self.device_handle.destroy_buffer(staging, None);
 		}
 		let mut guard = self.allocator.lock().unwrap();
@@ -307,17 +357,8 @@ impl GpuContext {
 				.expect("bind staging buffer");
 		}
 
-		// 3. Record copy command
-		let cmd = unsafe {
-			self.device_handle
-				.allocate_command_buffers(
-					&vk::CommandBufferAllocateInfo::default()
-						.command_pool(self.command_pool)
-						.level(vk::CommandBufferLevel::PRIMARY)
-						.command_buffer_count(1),
-				)
-				.expect("allocate command buffer")[0]
-		};
+		// 3. Record copy command from pooled buffer
+		let cmd = Self::alloc_cmd_buffer(&self.device_handle, self.command_pool, &self.cmd_buffer_pool);
 		unsafe {
 			self.device_handle
 				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
@@ -336,16 +377,12 @@ impl GpuContext {
 				.expect("end command buffer");
 		}
 
-		// 4. Submit and wait
+		// 4. Submit and wait (reuse fence from pool)
 		eprintln!(
 			"[DOWNLOAD] t+{:3}ms  creating fence + submitting...",
 			t.elapsed().as_millis()
 		);
-		let fence = unsafe {
-			self.device_handle
-				.create_fence(&vk::FenceCreateInfo::default(), None)
-				.expect("create fence")
-		};
+		let fence = Self::alloc_fence(&self.device_handle, &self.fence_pool);
 		unsafe {
 			self.device_handle
 				.queue_submit(
@@ -354,7 +391,7 @@ impl GpuContext {
 					fence,
 				)
 				.expect("submit download");
-			eprintln!("[DOWNLOAD] t+{:3}ms  queue_submit done, waiting on fence (BLOCKS HERE = GPU HANG)...", t.elapsed().as_millis());
+			eprintln!("t+{:3}ms  queue_submit done, waiting on fence (BLOCKS HERE = GPU HANG)...", t.elapsed().as_millis());
 			self.device_handle
 				.wait_for_fences(&[fence], true, u64::MAX)
 				.expect("wait download fence");
@@ -377,11 +414,11 @@ impl GpuContext {
 			}
 		}
 
-		// 6. Cleanup
+		// 6. Cleanup — recycle cmd buffer + fence back to pools
 		unsafe {
-			self.device_handle.destroy_fence(fence, None);
-			self.device_handle
-				.free_command_buffers(self.command_pool, &[cmd]);
+			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
+			self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			self.cmd_buffer_pool.lock().unwrap().push(cmd);
 			self.device_handle.destroy_buffer(staging, None);
 		}
 		let mut guard = self.allocator.lock().unwrap();
@@ -799,7 +836,7 @@ impl MemoryController {
 
 		// ── Load SPIR-V module ──
 		eprintln!("[PIPELINE] Loading SPIR-V bytes...");
-		let spirv_bytes: &[u8] = include_bytes!("../models/dedupe/quantize_gemv.spv");
+		let spirv_bytes: &[u8] = include_bytes!("../models/compression/quantize_gemv.spv");
 		eprintln!("[PIPELINE] SPIR-V loaded: {} bytes", spirv_bytes.len());
 
 		let spirv_words: Vec<u32> = spirv_bytes
@@ -909,8 +946,6 @@ impl MemoryController {
 			.expect("allocate_descriptor_sets")[0];
 		eprintln!("[PIPELINE] Descriptor set allocated OK");
 
-		// ── HERE IS THE FIX: Calculate offsets inside your single sparse buffer ──
-		// Adjust these multiplier values depending on how many pages each section needs!
 		let binding0_offset = 0;
 		let binding0_range  = page_size * 100; // Example: SourceWeights takes 100 pages
 
@@ -1045,3 +1080,45 @@ impl MemoryController {
 		}
 	}
 }
+
+
+
+
+/// GPU buffer layout matching TensorArenaArchitecture.pdf spec.
+///
+/// Memory layout (contiguous, in order):
+///   1. ModelSize          — 4 bytes  (u32: total block count)
+///   2. GPUWorkPool        — blocks × 4 bytes  (u32 per block, bits 30/31 are status)
+///   3. BlockSizeBuffer    — blocks × 4 bytes  (u32: high16=width, low16=height)
+///   4. BlockData          — blocks × block_size × 4 bytes  (f32 weights)
+///   5. Buckets            — blocks × bucket_region_size
+///
+/// Per-block bucket region: 100 bucket entries.
+/// Each bucket: u8 prefix_index + u16[BlockSize/100] tail_indices.
+
+/// Initialize the global MemoryController from Vulkan hardware.
+/// Must be called once before any gpu_quantize() calls.
+/// Returns true if initialized, false if already initialized.
+pub fn init_global_controller(
+	instance: &ash::Instance,
+	physical_device: ash::vk::PhysicalDevice,
+	device: ash::Device,
+	queue: ash::vk::Queue,
+	allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> Result<(), String> {
+	let ctrl = unsafe {
+		MemoryController::initialize_controller_from_hardware(
+			instance,
+			physical_device,
+			device,
+			queue,
+			allocator,
+		)
+	};
+	GLOBAL_CONTROLLER
+		.set(Arc::new(Mutex::new(ctrl)))
+		.map_err(|_| "Global controller already initialized".to_string())
+}
+
+/// Global MemoryController — initialized once by init_global_controller().
+pub static GLOBAL_CONTROLLER: OnceLock<Arc<Mutex<MemoryController>>> = OnceLock::new();

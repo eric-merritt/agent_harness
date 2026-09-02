@@ -2,7 +2,7 @@ use super::common::{ConversionStats, TensorStats};
 use super::core::*;
 use crate::memory_controller::virtual_tensor_arena::{PageResidency, VirtualTensorArena};
 use crate::models::avx512_kernel::*;
-use crate::models::dedupe::types::Sandbag;
+use crate::models::formats::sandbag::Sandbag;
 use memmap2::Mmap;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
@@ -138,7 +138,7 @@ pub struct ChunkInfo {
 	core_pos: usize,
 	sand_pos: usize,
 	element_count: usize,
-	remap: Option<crate::models::dedupe::types::ChunkRemap>,
+	remap: Option<crate::models::formats::sandbag::ChunkRemap>,
 }
 
 impl ModelLoader {
@@ -149,7 +149,7 @@ impl ModelLoader {
 	pub fn decompress_tensor_global(
 		&self,
 		name: &str,
-		global: Arc<crate::models::dedupe::types::GlobalTable>,
+		global: Arc<crate::models::formats::sandbag::GlobalTable>,
 	) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
 		self.decompress_tensor_impl(name, Some(global), true)
 	}
@@ -157,7 +157,7 @@ impl ModelLoader {
 	pub fn decompress_tensor_global_single(
 		&self,
 		name: &str,
-		global: Arc<crate::models::dedupe::types::GlobalTable>,
+		global: Arc<crate::models::formats::sandbag::GlobalTable>,
 	) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
 		self.decompress_tensor_impl(name, Some(global), false)
 	}
@@ -165,7 +165,7 @@ impl ModelLoader {
 	fn decompress_tensor_impl(
 		&self,
 		name: &str,
-		global: Option<Arc<crate::models::dedupe::types::GlobalTable>>,
+		global: Option<Arc<crate::models::formats::sandbag::GlobalTable>>,
 		parallel_chunks: bool,
 	) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
 		let idx = *self

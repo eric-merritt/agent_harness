@@ -1,11 +1,11 @@
 // Shared AVX-512 kernels for the models crate.
 //
-// Both the dedup compression pipeline and the convert pipeline use these
+// Both the compression compression pipeline and the convert pipeline use these
 // kernels. Keep them here so neither module owns the SIMD intrinsics.
 
 use super::convert::common::{CHUNK_SIZE, CompressJob, CompressOutput};
-use super::dedupe::truncation::quantize_block;
-use super::dedupe::types::{Sandbag, UniqueTail};
+use super::compression::truncation::quantize_block;
+use super::formats::sandbag::{Sandbag,UniqueTail};
 use hashbrown::HashMap as AHashMap;
 use std::arch::x86_64::*;
 
@@ -16,7 +16,7 @@ pub unsafe fn compress_job_avx512(
 	truncate_rounds: usize,
 ) -> CompressOutput {
 	// Keep exact signatures and variable initializations
-	use crate::models::dedupe::tensor::DedupCountTensor;
+	use crate::models::compression::tensor::DedupCountTensor;
 
 	let weights = &job.weights;
 	let n = weights.len();
@@ -283,7 +283,7 @@ pub unsafe fn compress_job_avx512(
 	let serialized_core = crate::models::convert::core::serialize_core(&tensor);
 
 	// Build sandbag from quantization results using prefix/tail split
-	let (scale, outliers) = quantize_block(weights);
+	let (size, meta_tensors) = quantize_block(weights);
 	let prefix_scale = 10f32.powi(prefix_digits as i32);
 	let tail_scale = 10_000_000.0f32;
 
@@ -317,13 +317,13 @@ pub unsafe fn compress_job_avx512(
 	}
 
 	let sandbag = Sandbag {
-		scale,
-		outliers,
+		size,
+		meta_tensors,
 		count: n,
 		prefix_digits,
 		unique_prefixes,
 		unique_tails: unique_tails_vec,
-		manifest,
+		index_signs,
 		signs,
 	};
 

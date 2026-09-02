@@ -3,7 +3,7 @@
 // Used by the GGUF, safetensors, and quantization conversion pipelines.
 
 pub use crate::models::avx512_kernel::avx512_preprocess_conversion_chunk;
-use crate::models::dedupe::tensor::DedupCountTensor;
+use crate::models::compression::tensor::DedupCountTensor;
 use crate::models::quantization::QuantizationLevels;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -78,3 +78,7 @@ sys
 2026-08-31-053742-local-command-caveatcaveat-the-messages-below.txt
 2026-08-31-044333-im-pretty-sure-youre-the-most-retarded-model-i.txt
 .~lock.memory_controller_architecture.txt#
+docs/
+docs/ADR.md docs/directory_structure.md docs/Phases.md docs/qwen-output.html
+scripts/print_tree.py
+scripts/

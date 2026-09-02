@@ -1,5 +1,5 @@
-use crate::models::dedupe::tensor::DedupCountTensor;
-use crate::models::dedupe::types::{ChunkRemap, GlobalTable, Sandbag};
+use crate::models::compression::tensor::DedupCountTensor;
+use crate::models::formats::sandbag::{ChunkRemap, GlobalTable, Sandbag};
 
 impl GlobalTable {
 	/// Constructs a unified GlobalTable from a slice of individual tensor chunks.
