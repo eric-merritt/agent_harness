@@ -192,6 +192,9 @@ impl GpuContext {
 	}
 
 	/// Synchronous upload: copy `data` into `buf` at `offset` via a staging buffer.
+	///
+	/// Deprecated — kept for callers that still need one-off uploads.
+	/// For batched page writes, use `batch_upload` instead.
 	pub unsafe fn upload(&self, buf: vk::Buffer, offset: vk::DeviceSize, data: &[u8]) {
 		use std::time::Instant;
 		let t = Instant::now();
@@ -209,10 +212,6 @@ impl GpuContext {
 		}
 
 		// 1. Create staging buffer
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  creating staging buffer...",
-			t.elapsed().as_millis()
-		);
 		let staging = unsafe {
 			self.device_handle
 				.create_buffer(
@@ -225,7 +224,7 @@ impl GpuContext {
 		};
 		let mem_reqs = unsafe { self.device_handle.get_buffer_memory_requirements(staging) };
 
-		// 2. Allocate host-visible mapped memory for the staging buffer
+		// 2. Allocate host-visible memory
 		let mut guard = self.allocator.lock().unwrap();
 		let alloc = guard
 			.allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
@@ -245,11 +244,6 @@ impl GpuContext {
 		}
 
 		// 3. Copy data into mapped staging memory
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  writing {} bytes to staging memory",
-			t.elapsed().as_millis(),
-			data.len()
-		);
 		if let Some(ptr) = alloc.mapped_ptr() {
 			unsafe {
 				std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>().as_ptr(), data.len());
@@ -258,26 +252,131 @@ impl GpuContext {
 			panic!("Staging allocation is not host-mapped");
 		}
 
-		// 4. Record copy command
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  allocating command buffer...",
-			t.elapsed().as_millis()
-		);
-		use core::mem;
-		let cp_raw = unsafe { mem::transmute::<vk::CommandPool, u64>(self.command_pool) };
-		let q_raw = unsafe { mem::transmute::<vk::Queue, u64>(self.queue_handle) };
-		eprintln!("[UPLOAD]    command_pool = 0x{:016X}", cp_raw);
-		eprintln!("[UPLOAD]    queue        = 0x{:016X}", q_raw);
+		// 4. Record + submit in one batch
+		let copies = vec![vk::BufferCopy::default()
+			.src_offset(0)
+			.dst_offset(offset)
+			.size(size)];
 
+		unsafe {
+			self.submit_copy_batch(staging, buf, &copies, t);
+		}
+
+		// 5. Cleanup staging buffer + allocation
+		unsafe {
+			self.device_handle.destroy_buffer(staging, None);
+		}
+		let mut guard = self.allocator.lock().unwrap();
+		let _ = guard.free(alloc);
+		eprintln!(
+			"[UPLOAD] t+{:3}ms  DONE — {} bytes",
+			t.elapsed().as_millis(),
+			data.len()
+		);
+	}
+
+	/// Batch multiple buffer copies into a single staging buffer + one submit.
+	/// Each `(staging_offset, dst_offset, size)` describes one copy region.
+	pub unsafe fn batch_upload(
+		&self,
+		buf: vk::Buffer,
+		regions: &[(vk::DeviceSize, vk::DeviceSize, vk::DeviceSize)],
+		data: &[&[u8]],
+	) {
+		use std::time::Instant;
+		let t = Instant::now();
+
+		if regions.is_empty() || data.is_empty() {
+			return;
+		}
+
+		// Compute total staging size
+		let total_size: vk::DeviceSize = regions.iter().map(|r| r.2).sum();
+		let mut staging_data = Vec::with_capacity(total_size as usize);
+		for (i, (_, _, _)) in regions.iter().enumerate() {
+			staging_data.extend_from_slice(data[i]);
+		}
+
+		// Create single staging buffer for all copies
+		let staging = unsafe {
+			self.device_handle
+				.create_buffer(
+					&vk::BufferCreateInfo::default()
+						.size(total_size)
+						.usage(vk::BufferUsageFlags::TRANSFER_SRC),
+					None,
+				)
+				.expect("create batch staging buffer")
+		};
+		let mem_reqs = unsafe { self.device_handle.get_buffer_memory_requirements(staging) };
+
+		let mut guard = self.allocator.lock().unwrap();
+		let alloc = guard
+			.allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+				name: "batch_staging_upload",
+				requirements: mem_reqs,
+				location: gpu_allocator::MemoryLocation::CpuToGpu,
+				linear: true,
+				allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+			})
+			.expect("allocate batch staging memory");
+		drop(guard);
+
+		unsafe {
+			self.device_handle
+				.bind_buffer_memory(staging, alloc.memory(), alloc.offset())
+				.expect("bind batch staging buffer");
+		}
+
+		// Write all data into mapped memory
+		if let Some(ptr) = alloc.mapped_ptr() {
+			unsafe {
+				std::ptr::copy_nonoverlapping(
+					staging_data.as_ptr(),
+					ptr.cast::<u8>().as_ptr(),
+					staging_data.len(),
+				);
+			}
+		} else {
+			panic!("Batch staging allocation is not host-mapped");
+		}
+
+		// Build copy regions — use the running staging offset so each page
+		// reads from its own slice, not all from zero.
+		let mut copies = Vec::with_capacity(regions.len());
+		for (stg_off, dst_off, sz) in regions {
+			copies.push(vk::BufferCopy::default()
+				.src_offset(*stg_off)
+				.dst_offset(*dst_off)
+				.size(*sz));
+		}
+
+		unsafe {
+			self.submit_copy_batch(staging, buf, &copies, t);
+		}
+
+		// Cleanup
+		unsafe {
+			self.device_handle.destroy_buffer(staging, None);
+		}
+		let mut guard = self.allocator.lock().unwrap();
+		let _ = guard.free(alloc);
+	}
+
+	/// Shared submit: record copies, submit, fence, recycle.
+	unsafe fn submit_copy_batch(
+		&self,
+		staging: vk::Buffer,
+		dst_buf: vk::Buffer,
+		copies: &[vk::BufferCopy],
+		_t: std::time::Instant,
+	) {
+		// Queue idle ensures no other work is in-flight on this queue
 		unsafe {
 			self.device_handle
 				.queue_wait_idle(self.queue_handle)
 				.expect("queue_wait_idle before cmd alloc");
 		}
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  queue idle, getting command buffer...",
-			t.elapsed().as_millis()
-		);
 
 		let cmd = Self::alloc_cmd_buffer(
 			&self.device_handle,
@@ -291,22 +390,15 @@ impl GpuContext {
 			self.device_handle.cmd_copy_buffer(
 				cmd,
 				staging,
-				buf,
-				&[vk::BufferCopy::default()
-					.src_offset(0)
-					.dst_offset(offset)
-					.size(size)],
+				dst_buf,
+				copies,
 			);
 			self.device_handle
 				.end_command_buffer(cmd)
 				.expect("end command buffer");
 		}
 
-		// 5. Submit and wait
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  creating fence + submitting...",
-			t.elapsed().as_millis()
-		);
+		// Submit and wait
 		let fence = Self::alloc_fence(&self.device_handle, &self.fence_pool);
 		unsafe {
 			self.device_handle
@@ -315,30 +407,19 @@ impl GpuContext {
 					&[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
 					fence,
 				)
-				.expect("submit upload");
-			eprintln!(
-				"[UPLOAD] t+{:3}ms  queue_submit done, waiting on fence (this may block)...",
-				t.elapsed().as_millis()
-			);
+				.expect("submit upload batch");
 			self.device_handle
 				.wait_for_fences(&[fence], true, u64::MAX)
 				.expect("wait upload fence");
-			eprintln!(
-				"[UPLOAD] t+{:3}ms  fence signaled, upload complete",
-				t.elapsed().as_millis()
-			);
 		}
 
-		// 6. Cleanup — recycle cmd buffer + fence back to pools
+		// Recycle fence and command buffer
 		unsafe {
 			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
 			self.device_handle
 				.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
 			self.cmd_buffer_pool.lock().unwrap().push(cmd);
-			self.device_handle.destroy_buffer(staging, None);
 		}
-		let mut guard = self.allocator.lock().unwrap();
-		let _ = guard.free(alloc);
 	}
 
 	/// Synchronous download: copy `size` bytes from `buf` at `offset` into a Vec.
@@ -590,6 +671,15 @@ impl MemoryController {
 		unsafe {
 			self.arena
 				.commit_page(self.gpu.device(), self.gpu.queue(), page_index);
+		}
+	}
+
+	/// Commit multiple pages. Serial — each sparse bind must be sequential.
+	pub fn commit_pages(&mut self, page_indices: &[usize]) {
+		for &page_idx in page_indices {
+			if self.arena.page_table[page_idx].residency == PageResidency::Unmapped {
+				self.commit_page(page_idx);
+			}
 		}
 	}
 
@@ -1196,22 +1286,44 @@ pub unsafe fn initialize_controller_from_hardware(
 		// Commit before writing. `write_page` only uploads to the sparse buffer for
 		// pages that are already GpuResident; an Unmapped page is routed to CPU RAM
 		// instead, which leaves the shader reading unbacked memory as zeros.
-		for (page_idx, _) in &tasks {
-			self.commit_page(*page_idx);
+		let page_indices: Vec<usize> = tasks.iter().map(|(idx, _)| *idx).collect();
+		self.commit_pages(&page_indices);
+
+		// Partition tasks into GPU (batched) and CPU (individual) groups.
+		let (gpu_pages, cpu_pages): (Vec<_>, Vec<_>) = tasks.into_iter().partition(|(idx, _)| {
+			self.arena.page_table[*idx].residency == PageResidency::GpuResident
+		});
+
+		// Batch ALL GPU page uploads into ONE staging buffer + ONE submit.
+		// Build regions with sequential staging offsets so each page copies from
+		// its own slice of the staging buffer, not all from offset 0.
+		if !gpu_pages.is_empty() {
+			let page_size = self.arena.page_size;
+			let mut stg_offset: vk::DeviceSize = 0;
+			let regions: Vec<(vk::DeviceSize, vk::DeviceSize, vk::DeviceSize)> = gpu_pages
+				.iter()
+				.map(|(idx, data)| {
+					let dst_offset = *idx as vk::DeviceSize * page_size;
+					let size = data.len() as vk::DeviceSize;
+					let cur_stg = stg_offset;
+					stg_offset += size;
+					(cur_stg, dst_offset, size)
+				})
+				.collect();
+			let data_slices: Vec<&[u8]> = gpu_pages.iter().map(|(_, d)| d.as_slice()).collect();
+			unsafe {
+				self.gpu
+					.batch_upload(self.arena.sparse_buffer, &regions, &data_slices);
+			}
 		}
 
-		// Serial, deliberately. A GpuResident page upload allocates a command
-		// buffer from `gpu.command_pool` and submits to `gpu.queue` — both are
-		// externally-synchronized Vulkan objects, so driving them from several
-		// rayon workers at once is undefined behaviour, not a speedup. The earlier
-		// parallel version survived only while models were small enough to fit a
-		// single page; at 32+ pages it took the process down mid-upload.
-		//
-		// The uploads all funnel through one queue anyway, so there was no real
-		// concurrency to win here. Parallelism belongs in the encode path, where
-		// `quantize_cpu` already uses it.
-		for (page_idx, data) in tasks {
-			self.write_page(page_idx, &data);
+		// CPU-bound pages written serially (CpuMemoryManager is not Send/Sync).
+		// The GPU batch is the performance-critical path — CPU writes are fast.
+		let page_size_usize = self.arena.page_size as usize;
+		for (page_idx, data) in cpu_pages {
+			self.cpu.write_page(page_idx, page_size_usize, &data);
+			self.arena.page_table[page_idx].residency = PageResidency::CpuResident;
+			self.arena.page_table[page_idx].cpu_offset = Some(page_idx * page_size_usize);
 		}
 
 		Ok(total_bytes)
