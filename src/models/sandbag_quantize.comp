@@ -1,0 +1,181 @@
+#version 450
+//
+// Sandbag quantize — Vulkan 1.3 compute.
+//
+// Encodes f32/f16/bf16 weights into the sandbag layout:
+//
+//   [ scales ]  ceil(N/32) x f16     per-block scale
+//   [ pairs  ]  N x (prefix_u8, tail_u8)
+//   [ signs  ]  ceil(N/64) x u64     at the very end
+//
+// SEQUENTIAL BY CONSTRUCTION
+// Every output address is a pure function of the invocation id. Nothing is
+// appended or compacted, and no invocation reads another's result. The encoding
+// is fixed-rate — two bytes per weight plus half a byte of scale, regardless of
+// value — which is what removes the prefix sum a variable-length scheme forces.
+//
+// NO ATOMICS, NO READ-MODIFY-WRITE
+// One invocation owns 64 consecutive weights, and 64 is the number that makes
+// all three planes land on whole uints at once:
+//
+//   scales   2 blocks x f16   = 1 uint   at scale_base + gid
+//   pairs    64 x 2 bytes     = 32 uints at pairs_base + gid*32
+//   signs    64 bits          = 1 u64    = 2 uints at sign_base + gid*2
+//
+// At 32 weights per invocation the scale plane would be a half-uint write and
+// two invocations would have to share a word. 64 removes that entirely: every
+// store is a whole aligned uint no other invocation touches.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// The whole arena is one flat binding: source weights and destination bytes are
+// both addressed through it, so the descriptor set stays immutable across every
+// tensor in the model.
+layout(std430, binding = 0) buffer Arena {
+    uint data[];
+};
+
+layout(push_constant) uniform Push {
+    uint  src_offset;    // byte offset of this tensor's source weights
+    uint  scale_offset;  // byte offset of the per-block scale plane
+    uint  pairs_offset;  // byte offset of the prefix/tail plane
+    uint  sign_offset;   // byte offset of the sign plane
+    uint  elem_count;    // weights in this tensor
+    uint  src_type;      // 0 = F32, 1 = F16, 2 = BF16
+    uint  tail_digits;   // 0..=3
+    float threshold;     // saturation point from CPU-side calibration
+} pc;
+
+const uint SRC_F32  = 0u;
+const uint SRC_F16  = 1u;
+const uint SRC_BF16 = 2u;
+
+// Weights per scale block, and per invocation. See the header comment.
+const uint BLOCK = 32u;
+const uint GROUP = 64u;
+
+float load_weight(uint i) {
+    if (pc.src_type == SRC_F32) {
+        return uintBitsToFloat(data[(pc.src_offset >> 2) + i]);
+    }
+
+    // 16-bit types: two per uint.
+    uint word = data[(pc.src_offset >> 2) + (i >> 1)];
+    uint bits = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16);
+
+    if (pc.src_type == SRC_BF16) {
+        // bf16 is the top 16 bits of an f32 — shift back up, no table needed.
+        return uintBitsToFloat(bits << 16);
+    }
+    return unpackHalf2x16(bits).x;
+}
+
+// Largest magnitude in [lo, hi), capped at the calibrated saturation point so a
+// single outlier cannot flatten the resolution of its whole block.
+float block_scale(uint lo, uint hi) {
+    float s = 0.0;
+    for (uint i = lo; i < hi; ++i) {
+        s = max(s, min(abs(load_weight(i)), pc.threshold));
+    }
+    // A zero block still needs a usable divisor.
+    return s > 0.0 ? s : 1.0;
+}
+
+// Split a normalized magnitude into the 2-digit prefix and the tail, packed with
+// prefix in the low byte and tail in the second.
+//
+// 0.2568939 -> five significant digits 25689 -> prefix 25, next three 689.
+//
+// A 3-digit tail is 1000 states and does not fit a byte, so at tail_digits == 3
+// it is rescaled uniformly into 0..255. At 1 or 2 digits the tail is exact.
+uint encode_magnitude(float mag) {
+    // floor(x + 0.5), not round(): GLSL leaves round()'s behaviour at exactly 0.5
+    // up to the implementation, while Rust's f32::round() always goes away from
+    // zero. mag is non-negative here, so floor(x + 0.5) matches it exactly and
+    // the CPU and GPU encoders stay byte-identical.
+    uint scaled = uint(clamp(floor(mag * 100000.0 + 0.5), 0.0, 99999.0));
+    uint prefix = min(scaled / 1000u, 99u);
+    uint rest   = scaled % 1000u;
+
+    uint tail;
+    if (pc.tail_digits == 0u) {
+        tail = 0u;
+    } else if (pc.tail_digits == 1u) {
+        tail = rest / 100u;
+    } else if (pc.tail_digits == 2u) {
+        tail = rest / 10u;
+    } else {
+        tail = (rest * 255u + 499u) / 999u;
+    }
+
+    return prefix | (tail << 8);
+}
+
+void main() {
+    uint gid  = gl_GlobalInvocationID.x;
+    uint base = gid * GROUP;
+    if (base >= pc.elem_count) {
+        return;
+    }
+
+    uint n = pc.elem_count;
+
+    // ── scales: two blocks, one uint ──
+    uint b0_hi = min(base + BLOCK, n);
+    uint b1_lo = min(base + BLOCK, n);
+    uint b1_hi = min(base + GROUP, n);
+
+    float s0 = block_scale(base, b0_hi);
+    float s1 = b1_hi > b1_lo ? block_scale(b1_lo, b1_hi) : 1.0;
+
+    // packHalf2x16 stores .x in the low half — matching the f16 pair order the
+    // CPU encoder writes for blocks 2g and 2g+1.
+    data[(pc.scale_offset >> 2) + gid] = packHalf2x16(vec2(s0, s1));
+
+    // Round-trip through f16 so the divisor is exactly what the file stores,
+    // and divide (rather than multiply by a reciprocal) to match the CPU encoder.
+    float div0 = unpackHalf2x16(packHalf2x16(vec2(s0, 0.0))).x;
+    float div1 = unpackHalf2x16(packHalf2x16(vec2(s1, 0.0))).x;
+
+    // ── pairs: 64 weights -> 32 uints ──
+    uint pairs_word = (pc.pairs_offset >> 2) + gid * (GROUP / 2u);
+    uint sign_lo = 0u;
+    uint sign_hi = 0u;
+
+    [[unroll]]
+    for (uint j = 0u; j < GROUP / 2u; ++j) {
+        uint i0 = base + j * 2u;
+        uint i1 = i0 + 1u;
+
+        uint lo = 0u;
+        uint hi = 0u;
+
+        if (i0 < n) {
+            float v = load_weight(i0);
+            if (v < 0.0) {
+                uint k = j * 2u;
+                if (k < 32u) { sign_lo |= 1u << k; } else { sign_hi |= 1u << (k - 32u); }
+            }
+            float d = (i0 < b0_hi) ? div0 : div1;
+            lo = encode_magnitude(min(min(abs(v), pc.threshold) / d, 1.0));
+        }
+        if (i1 < n) {
+            float v = load_weight(i1);
+            if (v < 0.0) {
+                uint k = j * 2u + 1u;
+                if (k < 32u) { sign_lo |= 1u << k; } else { sign_hi |= 1u << (k - 32u); }
+            }
+            float d = (i1 < b0_hi) ? div0 : div1;
+            hi = encode_magnitude(min(min(abs(v), pc.threshold) / d, 1.0));
+        }
+
+        data[pairs_word + j] = lo | (hi << 16);
+    }
+
+    // ── signs: 64 bits = one u64 = two uints, little-endian ──
+    uint sign_word = (pc.sign_offset >> 2) + gid * 2u;
+    data[sign_word]      = sign_lo;
+    data[sign_word + 1u] = sign_hi;
+}

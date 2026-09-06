@@ -14,7 +14,9 @@ pub mod attention;
 pub mod config;
 pub mod ffn;
 pub mod kv_cache;
-pub mod math;
+// `kernels` is already a top-level module; aliasing it keeps every existing
+// `math::` path working without compiling the whole kernel tree a second time.
+pub use crate::kernels as math;
 pub mod progress;
 pub mod sampling;
 pub mod ssm;
@@ -26,10 +28,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::models::convert::core::deserialize_core_chunks;
-use crate::models::convert::loader::ModelLoader;
-use crate::models::compression::tensor::DedupCountTensor;
-use crate::models::formats::sandbag::GlobalTable;
+use crate::models::format::SandbagReader;
 use config::ModelConfig;
 use tokenizer::Tokenizer;
 
@@ -40,10 +39,9 @@ pub use ssm::{SsmBlock, SsmState};
 
 /// Running inference engine. Loads compressed model, holds state.
 pub struct InferenceEngine {
-	pub loader: ModelLoader,
+	pub loader: SandbagReader,
 	pub config: ModelConfig,
 	pub tokenizer: Tokenizer,
-	pub global_table: Arc<GlobalTable>,
 	pub kv_caches: Vec<KvCache>,
 	pub ssm_states: Vec<SsmState>,
 	/// Tensor name → (byte offset in mmap, element_count, is_4bit, group_size).
@@ -63,6 +61,7 @@ pub struct InferenceEngine {
 	pub scratch_attn_k: Vec<f32>,
 	pub scratch_attn_v: Vec<f32>,
 	pub scratch_attn_out: Vec<f32>,
+	pub scratch_scores: Vec<f32>,
 }
 
 impl InferenceEngine {
@@ -80,7 +79,8 @@ impl InferenceEngine {
 		if let Some(p) = progress {
 			p.set(6, "Reading model config...");
 		}
-		let loader = ModelLoader::open(model_dir)?;
+		let loader = SandbagReader::from_path(&model_dir.join("model.sandbag"))
+			.map_err(std::io::Error::other)?;
 		let config = ModelConfig::from_dir(model_dir)?;
 
 		if let Some(p) = progress {
@@ -113,12 +113,8 @@ impl InferenceEngine {
 			config.n_embd
 		);
 
-		// ── FIXED: Resolved repeated table parsing implementation loops ──
-		if let Some(p) = progress {
-			p.set(9, "Loading global table...");
-		}
-		let global_table = Self::build_global_table(&loader)?;
-
+		// No global table: sandbag carries no shared lookup structure. Every weight
+		// decodes from its own prefix/tail/sign with nothing else consulted.
 		if let Some(p) = progress {
 			p.set(10, "Validating tensor names...");
 		}
@@ -171,7 +167,6 @@ impl InferenceEngine {
 			loader,
 			config,
 			tokenizer,
-			global_table: Arc::new(global_table),
 			kv_caches,
 			ssm_states,
 			tensor_index: HashMap::new(),
@@ -190,181 +185,16 @@ impl InferenceEngine {
 			scratch_attn_k: vec![0.0; n_embd_kv],
 			scratch_attn_v: vec![0.0; n_embd_kv],
 			scratch_attn_out: vec![0.0; n_embd],
+			scratch_scores: vec![0.0; 4096],
 		})
 	}
 
-	fn build_global_table(loader: &ModelLoader) -> Result<GlobalTable, Box<dyn std::error::Error>> {
-		let mut core_file = File::open(loader.dir.join("weights.bin"))?;
-		let mut all_tensors: Vec<DedupCountTensor> = Vec::new();
-
-		for stats in &loader.manifest.tensors {
-			if stats.core_bytes == 0 || stats.sandbag_bytes == 0 {
-				continue;
-			}
-			core_file.seek(SeekFrom::Start(stats.weight_offset))?;
-			let mut buf = vec![0u8; stats.core_bytes];
-			core_file.read_exact(&mut buf)?;
-			let chunks = deserialize_core_chunks(&buf);
-			for chunk in chunks {
-				all_tensors.push(chunk);
-			}
-		}
-
-		Ok(GlobalTable::new(&all_tensors))
-	}
-
-	pub fn decompress_all_parallel(
-		&mut self,
-		num_workers: usize,
-		progress: Option<&progress::LoadingProgress>,
-	) {
-		use crate::models::quantization;
-		use std::sync::{Mutex, mpsc};
-		use std::thread;
-
-		let all_names: Vec<String> = self
-			.loader
-			.tensor_names()
-			.iter()
-			.map(|s| s.to_string())
-			.collect();
-		let total = all_names.len();
-		let gs = quantization::GROUP_SIZE;
-
-		let mut tensor_plan: Vec<(String, u64, usize, bool, usize)> = Vec::with_capacity(total);
-		let mut offset = 0u64;
-		for name in &all_names {
-			if let Some(stats) = self.loader.tensor_stats(name) {
-				let is_fp = stats.full_precision || stats.sandbag_bytes == 0;
-				let bytes = if is_fp {
-					stats.element_count * 4
-				} else {
-					quantization::quantized_bytes(stats.element_count, gs)
-				};
-				tensor_plan.push((name.clone(), offset, stats.element_count, !is_fp, gs));
-				offset += bytes as u64;
-			}
-		}
-		self.write_pos = offset;
-		let total_bytes = offset;
-
-		log::info!(
-			"decompress_all_parallel: {} tensors, {:.2} GB, {} workers",
-			total,
-			total_bytes as f64 / 1e9,
-			num_workers
-		);
-
-		{
-			let file = std::fs::OpenOptions::new()
-				.write(true)
-				.open(&self.temp_path)
-				.expect("temp file not open");
-			file.set_len(total_bytes)
-				.expect("failed to pre-allocate temp file");
-		}
-
-		let tensor_plan = Arc::new(tensor_plan);
-		let work_queue = Arc::new(Mutex::new(
-			(0..total).collect::<std::collections::VecDeque<_>>(),
-		));
-		let (tx, rx) = mpsc::channel::<(String, u64, usize, bool, usize)>();
-		let dir = self.loader.dir.clone();
-		let global_table = Arc::clone(&self.global_table);
-		let temp_path = self.temp_path.clone();
-		let num_workers = num_workers.max(1);
-		let handles: Vec<_> = (0..num_workers)
-			.map(|_| {
-				let wq = Arc::clone(&work_queue);
-				let dir = dir.clone();
-				let gt = Arc::clone(&global_table);
-				let tp = Arc::clone(&tensor_plan);
-				let temp = temp_path.clone();
-				let tx = tx.clone();
-
-				thread::spawn(move || {
-					let loader = match ModelLoader::open(&dir) {
-						Ok(l) => l,
-						Err(e) => {
-							log::error!("Worker: failed to open ModelLoader: {}", e);
-							return;
-						}
-					};
-					let mut file = match std::fs::OpenOptions::new().write(true).open(&temp) {
-						Ok(f) => f,
-						Err(e) => {
-							log::error!("Worker: failed to open temp file: {}", e);
-							return;
-						}
-					};
-
-					loop {
-						let idx = { wq.lock().unwrap().pop_front() };
-						let Some(idx) = idx else {
-							break;
-						};
-						let (name, byte_offset, elem_count, is_4bit, group_size) = &tp[idx];
-
-						match loader.decompress_tensor_global_single(name, Arc::clone(&gt)) {
-							Ok(weights) => {
-								if *is_4bit {
-									let (scales, packed) =
-										quantization::quantize(&weights, *group_size);
-									let mut buf =
-										Vec::with_capacity(scales.len() * 4 + packed.len());
-									for &s in &scales {
-										buf.extend_from_slice(&s.to_le_bytes());
-									}
-									buf.extend_from_slice(&packed);
-									file.seek(SeekFrom::Start(*byte_offset)).ok();
-									let _ = file.write_all(&buf);
-								} else {
-									let bytes: &[u8] = bytemuck::cast_slice(&weights);
-									file.seek(SeekFrom::Start(*byte_offset)).ok();
-									let _ = file.write_all(bytes);
-								}
-								let _ = tx.send((
-									name.clone(),
-									*byte_offset,
-									*elem_count,
-									*is_4bit,
-									*group_size,
-								));
-							}
-							Err(e) => {
-								log::error!("Worker: failed to decompress {}: {}", name, e);
-							}
-						}
-					}
-				})
-			})
-			.collect();
-
-		drop(tx);
-		let mut completed = 0;
-		while let Ok((name, byte_offset, elem_count, is_4bit, group_size)) = rx.recv() {
-			self.tensor_index
-				.insert(name, (byte_offset, elem_count, is_4bit, group_size));
-			completed += 1;
-			if let Some(p) = progress {
-				let pct = 10 + ((completed as u32 * 85) / total.max(1) as u32).min(85) as u8;
-				p.set(
-					pct,
-					&format!("Decompressing {}/{} tensors", completed, total),
-				);
-			}
-		}
-
-		for h in handles {
-			if let Err(e) = h.join() {
-				log::error!("decompress_all_parallel: worker panicked: {:?}", e);
-			}
-		}
-		log::info!(
-			"decompress_all_parallel: {} tensors decompressed",
-			self.tensor_index.len()
-		);
-	}
+	// NOTE: `decompress_all_parallel` was removed here. It decompressed the whole
+	// model to a temp file ahead of inference using the superseded global-table
+	// scheme, via `models::conversion::loader::ModelLoader` and
+	// `models::quantization` — both deleted. Sandbag needs no such pre-pass:
+	// weights decode inline in the GEMV kernel as sign · (prefix ++ tail).
+	// It had no callers outside this file.
 
 	pub fn finalize_mmap(&mut self) {
 		if self.mmap.is_some() {
@@ -562,17 +392,20 @@ impl InferenceEngine {
 			math::rope_multi(&mut self.scratch_attn_k, pos, rope_dim, rope_sec, rope_fb);
 
 			let kv = &mut self.kv_caches[il];
-			let max_seq = kv.max_seq_len;
 			for h in 0..n_head_kv {
-				for d in 0..n_embd_head {
-					kv.k[h * n_embd_head * max_seq + d * max_seq + pos] =
-						self.scratch_attn_k[h * n_embd_head + d];
-					kv.v[h * n_embd_head * max_seq + d * max_seq + pos] =
-						self.scratch_attn_v[h * n_embd_head + d];
-				}
+				let off = h * n_embd_head;
+				kv.write_k(h, pos, &self.scratch_attn_k[off..off + n_embd_head]);
+				kv.write_v(h, pos, &self.scratch_attn_v[off..off + n_embd_head]);
 			}
 
 			let scale = 1.0 / (n_embd_head as f32).sqrt();
+			let active_len = pos + 1;
+			let scores = &mut self.scratch_scores[0..active_len];
+
+			// Temporary buffer for reading a single K/V row
+			let mut k_row = vec![0.0f32; n_embd_head];
+			let mut v_row = vec![0.0f32; n_embd_head];
+
 			for h in 0..n_head {
 				let kv_head = if n_head_kv > 0 {
 					h * n_head_kv / n_head
@@ -580,29 +413,35 @@ impl InferenceEngine {
 					0
 				};
 				let qoff = h * n_embd_head;
-				let mut scores = vec![0.0f32; pos + 1];
+
+				// Compute dot products and store in scores[0..=pos]
 				let mut max_s = f32::NEG_INFINITY;
-				for p in 0..=pos {
+				for p in 0..active_len {
+					kv.read_k(kv_head, p, &mut k_row);
 					let mut dot = 0.0f32;
 					for d in 0..n_embd_head {
-						dot += self.scratch_attn_q[qoff + d]
-							* kv.k[kv_head * n_embd_head * max_seq + d * max_seq + p];
+						dot += self.scratch_attn_q[qoff + d] * k_row[d];
 					}
 					scores[p] = dot * scale;
 					if scores[p] > max_s {
 						max_s = scores[p];
 					}
 				}
+
+				// Softmax
 				let mut sum_exp = 0.0f32;
-				for s in scores.iter_mut() {
+				for s in &mut scores[0..active_len] {
 					*s = (*s - max_s).exp();
 					sum_exp += *s;
 				}
 				let inv = 1.0 / sum_exp;
+
+				// Weighted sum of V
 				for d in 0..n_embd_head {
 					let mut acc = 0.0f32;
-					for p in 0..=pos {
-						acc += scores[p] * kv.v[kv_head * n_embd_head * max_seq + d * max_seq + p];
+					for p in 0..active_len {
+						kv.read_v(kv_head, p, &mut v_row);
+						acc += scores[p] * v_row[d];
 					}
 					self.scratch_attn_out[qoff + d] = acc * inv;
 				}

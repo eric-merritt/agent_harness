@@ -69,6 +69,7 @@ impl<'a> AttnBlock<'a> {
 
 	/// Forward pass for a single token (autoregressive decoding).
 	/// Employs pre-allocated state scratchpads to enforce zero-allocation execution paths.
+	/// Writes result into `output` (must be length `n_embd`).
 	pub fn forward(
 		&self,
 		input: &[f32],
@@ -76,7 +77,8 @@ impl<'a> AttnBlock<'a> {
 		state: &mut AttnState,
 		pos: usize,
 		config: &ModelConfig,
-	) -> Vec<f32> {
+		output: &mut [f32],
+	) {
 		let n_embd = config.n_embd;
 		let n_head = config.n_head;
 		let n_head_kv = config.n_head_kv;
@@ -250,15 +252,13 @@ impl<'a> AttnBlock<'a> {
 		}
 
 		// ---- Output projection (Zero-allocation final pipeline pass) ----
-		let mut out = vec![0.0f32; n_embd];
 		math::gemv_into(
-			&mut out,
+			output,
 			self.wo,
 			&state.proj_input[0..attn_total_dim],
 			n_embd,
 			attn_total_dim,
 		);
-		out
 	}
 }
 
@@ -341,8 +341,9 @@ mod tests {
 
 		let mut state = AttnState::new(&config);
 		let input = vec![1.0f32; n_embd];
+		let mut out = vec![0.0f32; n_embd];
 
-		let out = block.forward(&input, &mut kv, &mut state, 0, &config);
+		block.forward(&input, &mut kv, &mut state, 0, &config, &mut out);
 
 		assert_eq!(out.len(), n_embd);
 		for &v in &out {

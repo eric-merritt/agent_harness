@@ -27,15 +27,9 @@ impl CpuMemory {
 		}
 
 		// Allocate a completely anonymous, unmapped backing zone in virtual memory
-		let pool = 
-			MmapOptions::new()
-				.len(total_size)
-				.map_anon()?;
+		let pool = MmapOptions::new().len(total_size).map_anon()?;
 
-		Ok(Self {
-			pool,
-			total_size,
-		})
+		Ok(Self { pool, total_size })
 	}
 
 	/// Query the underlying Operating System for immediate available bytes
@@ -44,8 +38,8 @@ impl CpuMemory {
 		let mut system = System::new();
 		system.refresh_memory(); // Only fetch memory statistics for maximum speed
 		system.available_memory() as usize
-	}	
-	
+	}
+
 	pub fn capacity(&self) -> usize {
 		self.total_size
 	}

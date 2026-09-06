@@ -1,0 +1,201 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+// Direct structured tensor matrix memory buffers
+layout(std430, set = 0, binding = 0) readonly buffer QueryBuffer { float Q[]; };
+layout(std430, set = 0, binding = 1) readonly buffer KeyBuffer   { float K[]; };
+layout(std430, set = 0, binding = 2) readonly buffer ValueBuffer { float V[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer OutBuffer   { float O[]; };
+
+layout(push_constant) uniform AttentionParams {
+    uint seq_len;
+    uint head_dim;       // Matrix inner shape (e.g. 64, 128, 256)
+    uint num_heads_q;    // E.g., 16 Query heads
+    uint num_heads_kv;   // E.g., 4 KV heads (GQA Ratio = 4)
+    uint rope_dim;       // Number of dimensions to apply RoPE to (<= head_dim)
+    float scale;         // 1.0 / sqrt(head_dim)
+    float rope_theta;    // Base frequency for RoPE (typically 10000.0 or 500000.0)
+} params;
+
+// Shared memory pools to hold data tiles on-chip
+shared float s_Q[128 * 128]; 
+shared float s_K[128 * 128]; 
+shared float s_V[128 * 128]; 
+
+void main() {
+    uint tx = gl_LocalInvocationID.x; // Thread lane maps 0 to 127
+    
+    uint block_row_idx = gl_WorkGroupID.x; 
+    uint head_q_idx = gl_WorkGroupID.y;    // Tracks individual Query head thread assignments
+    
+    // --- STEP 1: GROUPED-QUERY ATTENTION (GQA) MAPPING CRITERIA ---
+    uint gqa_group_size = params.num_heads_q / params.num_heads_kv;
+    uint head_kv_idx = head_q_idx / gqa_group_size; // Maps multiple Q heads to 1 shared KV head
+
+    // Calculate absolute base indices for memory lookups
+    uint q_head_stride = params.seq_len * params.head_dim;
+    uint kv_head_stride = params.seq_len * params.head_dim;
+    
+    uint q_base  = head_q_idx * q_head_stride;
+    uint kv_base = head_kv_idx * kv_head_stride;
+
+    // Local registers tracking thread-specific row tracking variables
+    float row_m = -1e30; 
+    float row_d = 0.0;   
+    
+    float thread_O[128]; // Maximum register allocation boundary matching head_dim
+    for(uint d = 0; d < 128; d++) {
+        thread_O[d] = 0.0;
+    }
+
+    // --- STEP 2: LOAD AND FUSE ROPE FOR QUERY TILE ---
+    uint q_row = (block_row_idx * 128) + tx;
+    if (q_row < params.seq_len) {
+        float local_q_reg[128];
+        for (uint d = 0; d < 128; d++) {
+            if (d < params.head_dim) {
+                local_q_reg[d] = Q[q_base + (q_row * params.head_dim) + d];
+            } else {
+                local_q_reg[d] = 0.0;
+            }
+        }
+        
+        // Inlined Query RoPE math to fix compiler syntax errors
+        for (uint i = 0; i < params.rope_dim; i += 2) {
+            float theta = pow(params.rope_theta, -float(i) / float(params.rope_dim));
+            float m_theta = float(q_row) * theta;
+            float cos_val = cos(m_theta);
+            float sin_val = sin(m_theta);
+
+            float x0 = local_q_reg[i];
+            float x1 = local_q_reg[i + 1];
+
+            local_q_reg[i]     = x0 * cos_val - x1 * sin_val;
+            local_q_reg[i + 1] = x0 * sin_val + x1 * cos_val;
+        }
+
+        // Commit the rotated values out into the local workgroup's Shared Memory shell
+        for (uint d = 0; d < params.head_dim; d++) {
+            s_Q[tx * params.head_dim + d] = local_q_reg[d];
+        }
+    }
+
+    // --- STEP 3: TILE MATRIX REDUCTION ITERATION BLOCK ---
+    uint num_col_blocks = (params.seq_len + 127) / 128;
+    
+    // Autoregressive Decoder Optimization: Column steps can truncate safely at block_row_idx
+    for (uint bc = 0; bc <= block_row_idx; bc++) {
+        
+        // Cooperatively load Key and Value tiles into shared memory
+        uint kv_row = (bc * 128) + tx;
+        if (kv_row < params.seq_len) {
+            float local_k_reg[128];
+            for (uint d = 0; d < 128; d++) {
+                if (d < params.head_dim) {
+                    local_k_reg[d] = K[kv_base + (kv_row * params.head_dim) + d];
+                } else {
+                    local_k_reg[d] = 0.0;
+                }
+            }
+            for (uint d = 0; d < params.head_dim; d++) {
+                s_V[tx * params.head_dim + d] = V[kv_base + (kv_row * params.head_dim) + d];
+            }
+
+            // Inlined Key RoPE math to fix compiler syntax errors
+            for (uint i = 0; i < params.rope_dim; i += 2) {
+                float theta = pow(params.rope_theta, -float(i) / float(params.rope_dim));
+                float m_theta = float(kv_row) * theta;
+                float cos_val = cos(m_theta);
+                float sin_val = sin(m_theta);
+
+                float x0 = local_k_reg[i];
+                float x1 = local_k_reg[i + 1];
+
+                local_k_reg[i]     = x0 * cos_val - x1 * sin_val;
+                local_k_reg[i + 1] = x0 * sin_val + x1 * cos_val;
+            }
+
+            for (uint d = 0; d < params.head_dim; d++) {
+                s_K[tx * params.head_dim + d] = local_k_reg[d];
+            }
+        } else {
+            // Safe alignment padding boundaries
+            for (uint d = 0; d < params.head_dim; d++) {
+                s_K[tx * params.head_dim + d] = 0.0;
+                s_V[tx * params.head_dim + d] = 0.0;
+            }
+        }
+        barrier(); // Flush memory writes to cache layout safely across all 128 threads
+
+        // --- STEP 4: COALESCE SCORES & ENFORCE DECODER CAUSAL MASKING ---
+        float scores[128];
+        float tile_max = -1e30;
+
+        if (q_row < params.seq_len) {
+            for (uint j = 0; j < 128; j++) {
+                uint current_col_token_idx = (bc * 128) + j;
+                
+                // Causal Condition: If the column token is in the future relative to the row token, mask it
+                if (current_col_token_idx > q_row || current_col_token_idx >= params.seq_len) {
+                    scores[j] = -1e30; 
+                } else {
+                    float dot_sum = 0.0;
+                    for (uint d = 0; d < params.head_dim; d++) {
+                        dot_sum += s_Q[tx * params.head_dim + d] * s_K[j * params.head_dim + d];
+                    }
+                    scores[j] = dot_sum * params.scale;
+                }
+                tile_max = max(tile_max, scores[j]);
+            }
+        }
+
+        // --- STEP 5: ONLINE SOFTMAX STATE RESCALING MATH ---
+        float old_m = row_m;
+        float new_m = max(old_m, tile_max);
+        float p_scale = exp(old_m - new_m);
+        
+        float alpha[128];
+        float tile_d = 0.0;
+        for (uint j = 0; j < 128; j++) {
+            alpha[j] = exp(scores[j] - new_m);
+            // If lane was causally masked out, force activation coefficient explicitly to zero
+            if (scores[j] <= -1e29) { alpha[j] = 0.0; }
+            tile_d += alpha[j];
+        }
+
+        float new_d = (row_d * p_scale) + tile_d;
+
+        // --- STEP 6: ACCUMULATE VALUE VECTOR TARGETS NATIVELY ---
+        if (q_row < params.seq_len) {
+            // Apply scale adjustment corrections to the existing register tracks
+            for (uint d = 0; d < params.head_dim; d++) {
+                thread_O[d] *= p_scale;
+            }
+
+            // Compute fused inner matrix multiplication step with the Value tile
+            for (uint j = 0; j < 128; j++) {
+                if (alpha[j] > 0.0) {
+                    for (uint d = 0; d < params.head_dim; d++) {
+                        thread_O[d] += alpha[j] * s_V[j * params.head_dim + d];
+                    }
+                }
+            }
+        }
+
+        // Advance numerical states to the next row block index
+        row_m = new_m;
+        row_d = new_d;
+
+        barrier(); // Sync thread block array states before loading the next sequential column chunks
+    }
+
+    // --- STEP 7: WRITE NORMALIZED CHANNELS TO GLOBAL VRAM ---
+    if (q_row < params.seq_len) {
+        uint out_row_base = q_base + (q_row * params.head_dim);
+        float inv_d = 1.0 / (row_d + 1e-6); // Small epsilon guard to prevent division by zero
+        for (uint d = 0; d < params.head_dim; d++) {
+            O[out_row_base + d] = thread_O[d] * inv_d;
+        }
+    }
+}

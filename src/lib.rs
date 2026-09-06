@@ -3,6 +3,7 @@ pub mod autoresearch;
 pub mod database;
 pub mod gan_loop;
 pub mod inference;
+pub mod kernels;
 pub mod mcp;
 pub mod memory_controller;
 pub mod messaging;

@@ -1,11 +1,13 @@
-use crate::memory_controller::{
-	cpu_mem_op::CpuMemory,
-	virtual_tensor_arena::{OperationType, PageResidency, VirtualTensorArena},
+use crate::memory_controller::virtual_tensor_arena::{
+	OperationType, PageResidency, VirtualTensorArena,
 };
+
 use ash::vk;
 use gpu_allocator::vulkan::Allocator;
 use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
+use std::ffi::c_void;
+use std::ffi::CStr;
 
 /// A block of model data to be paged into the arena.
 #[derive(Clone, Debug)]
@@ -14,6 +16,32 @@ pub struct BlockDescriptor {
 	pub offset: u64,
 	/// Number of bytes in this block
 	pub size: u64,
+}
+
+/// Per-dispatch parameters for the sandbag quantize shader.
+///
+/// Every field is a byte or element offset into the single flat arena binding, so
+/// one immutable descriptor set serves every tensor in the model. Layout must match
+/// the `push_constant` block in `src/models/sandbag_quantize.comp` exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuantizePushConstants {
+	/// Byte offset of this tensor's source weights within the arena.
+	pub src_offset: u32,
+	/// Byte offset of this tensor's per-block scale plane.
+	pub scale_offset: u32,
+	/// Byte offset of this tensor's prefix/tail plane.
+	pub pairs_offset: u32,
+	/// Byte offset of this tensor's sign plane (u64 words, at the very end).
+	pub sign_offset: u32,
+	/// Number of weights in this tensor.
+	pub elem_count: u32,
+	/// Source element type: 0 = F32, 1 = F16, 2 = BF16.
+	pub src_type: u32,
+	/// Tail digits retained: 0..=3.
+	pub tail_digits: u32,
+	/// Saturation point from CPU-side calibration.
+	pub threshold: f32,
 }
 
 // GPU context — holds Vulkan device, queue, allocator, and command pool handles.
@@ -145,7 +173,9 @@ impl GpuContext {
 		fence: vk::Fence,
 		pooled: &std::sync::Mutex<Vec<vk::Fence>>,
 	) {
-		unsafe { device.reset_fences(&[fence]).expect("reset fence for pool"); }
+		unsafe {
+			device.reset_fences(&[fence]).expect("reset fence for pool");
+		}
 		pooled.lock().unwrap().push(fence);
 	}
 
@@ -155,7 +185,9 @@ impl GpuContext {
 		cmd: vk::CommandBuffer,
 		pooled: &std::sync::Mutex<Vec<vk::CommandBuffer>>,
 	) {
-		unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()); }
+		unsafe {
+			device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+		}
 		pooled.lock().unwrap().push(cmd);
 	}
 
@@ -193,7 +225,7 @@ impl GpuContext {
 		};
 		let mem_reqs = unsafe { self.device_handle.get_buffer_memory_requirements(staging) };
 
-		// 2. Allocate host-visible memory
+		// 2. Allocate host-visible mapped memory for the staging buffer
 		let mut guard = self.allocator.lock().unwrap();
 		let alloc = guard
 			.allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
@@ -242,9 +274,16 @@ impl GpuContext {
 				.queue_wait_idle(self.queue_handle)
 				.expect("queue_wait_idle before cmd alloc");
 		}
-		eprintln!("[UPLOAD] t+{:3}ms  queue idle, getting command buffer...", t.elapsed().as_millis());
+		eprintln!(
+			"[UPLOAD] t+{:3}ms  queue idle, getting command buffer...",
+			t.elapsed().as_millis()
+		);
 
-		let cmd = Self::alloc_cmd_buffer(&self.device_handle, self.command_pool, &self.cmd_buffer_pool);
+		let cmd = Self::alloc_cmd_buffer(
+			&self.device_handle,
+			self.command_pool,
+			&self.cmd_buffer_pool,
+		);
 		unsafe {
 			self.device_handle
 				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
@@ -293,7 +332,8 @@ impl GpuContext {
 		// 6. Cleanup — recycle cmd buffer + fence back to pools
 		unsafe {
 			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
-			self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			self.device_handle
+				.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
 			self.cmd_buffer_pool.lock().unwrap().push(cmd);
 			self.device_handle.destroy_buffer(staging, None);
 		}
@@ -358,7 +398,11 @@ impl GpuContext {
 		}
 
 		// 3. Record copy command from pooled buffer
-		let cmd = Self::alloc_cmd_buffer(&self.device_handle, self.command_pool, &self.cmd_buffer_pool);
+		let cmd = Self::alloc_cmd_buffer(
+			&self.device_handle,
+			self.command_pool,
+			&self.cmd_buffer_pool,
+		);
 		unsafe {
 			self.device_handle
 				.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
@@ -391,7 +435,10 @@ impl GpuContext {
 					fence,
 				)
 				.expect("submit download");
-			eprintln!("t+{:3}ms  queue_submit done, waiting on fence (BLOCKS HERE = GPU HANG)...", t.elapsed().as_millis());
+			eprintln!(
+				"t+{:3}ms  queue_submit done, waiting on fence (BLOCKS HERE = GPU HANG)...",
+				t.elapsed().as_millis()
+			);
 			self.device_handle
 				.wait_for_fences(&[fence], true, u64::MAX)
 				.expect("wait download fence");
@@ -417,7 +464,8 @@ impl GpuContext {
 		// 6. Cleanup — recycle cmd buffer + fence back to pools
 		unsafe {
 			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
-			self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			self.device_handle
+				.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
 			self.cmd_buffer_pool.lock().unwrap().push(cmd);
 			self.device_handle.destroy_buffer(staging, None);
 		}
@@ -708,123 +756,46 @@ impl MemoryController {
 		(self.arena.sparse_buffer, offset)
 	}
 
-	// src/memory_controller/controller.rs
+	/// Locate the compiled sandbag quantize shader.
+	///
+	/// Searched at runtime rather than `include_bytes!` so the crate still builds
+	/// before `glslangValidator` has produced the artifact. Returns `None` if the
+	/// shader has not been compiled yet — the GPU path then reports itself as
+	/// unavailable instead of silently producing garbage.
+	fn find_quantize_spirv() -> Option<Vec<u8>> {
+		let mut candidates: Vec<std::path::PathBuf> = vec![
+			std::path::PathBuf::from(concat!(
+				env!("CARGO_MANIFEST_DIR"),
+				"/src/models/sandbag_quantize.spv"
+			)),
+			std::path::PathBuf::from("src/models/sandbag_quantize.spv"),
+		];
+		if let Ok(exe) = std::env::current_exe() {
+			if let Some(dir) = exe.parent() {
+				candidates.push(dir.join("sandbag_quantize.spv"));
+			}
+		}
 
-    /// Dynamically inspects the host OS and Vulkan physical device to initialize the arena
-    /// with zero hardcoded constraints.
-    /// The `device` parameter may have been created from an instance that is already dropped;
-    /// we reload its function pointers via vkGetDeviceProcAddr so they remain valid.
-    pub unsafe fn initialize_controller_from_hardware(
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        device: ash::Device,
-        queue: vk::Queue,
-        allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
-    ) -> MemoryController {
-        // ── 0. Reload device function pointers independently of the instance ──
-        // The `device` was created by instance.create_device(), which loaded VFNs via
-        // vkGetInstanceProcAddr. If the Instance is dropped (e.g. init_gpu() returns),
-        // those tables may dangle. Reload with vkGetDeviceProcAddr instead.
-        use std::ffi::CStr;
-        let raw_device = device.handle();
-        let entry = unsafe { ash::Entry::load() }.expect("load Entry");
-        eprintln!("[CONTROLLER] initialize_controller_from_hardware START");
-        
-        // ── 1. Query OS for Available System Memory (CPU) ──
-        let mut sys = System::new_all();
-        sys.refresh_memory();
-        let cpu_bytes = sys.available_memory();
-        eprintln!("[CONTROLLER] CPU available: {} bytes", cpu_bytes);
-        
-        // ── 2. Query Vulkan Device for Device-Local Memory (VRAM) ──
-        let mem_properties =
-            unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let mut vram_bytes = 0u64;
-        for i in 0..mem_properties.memory_heap_count as usize {
-            let heap = mem_properties.memory_heaps[i];
-            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
-                vram_bytes = vram_bytes.max(heap.size);
-            }
-        }
-        eprintln!("[CONTROLLER] VRAM: {} bytes", vram_bytes);
-        
-        // ── 3. Resolve queue family for command pool ──
-        let queue_family_props =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let queue_family = queue_family_props
-            .iter()
-            .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .unwrap_or_else(|| {
-                queue_family_props
-                    .iter()
-                    .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                    .expect("No suitable queue family")
-            }) as u32;
-            
-        // ── 4. Create persistent command pool ──
-        let command_pool = unsafe {
-            device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                        .queue_family_index(queue_family),
-                    None,
-                )
-                .expect("Failed to create command pool")
-        };
-        
-        // ── 5. Calculate Arena Layout Constraints ──
-        let reserved = 4_000_000_000u64;
-        let total_addressable = (cpu_bytes + vram_bytes).saturating_sub(reserved);
-        let page_size: vk::DeviceSize = 64 * 1024; // 64 KiB pages
-        let total_pages = (total_addressable / page_size) as usize;
-        
-        // ── 5a. Create the sparse buffer arena first (pipeline needs its handle) ──
-        let arena = unsafe {
-            VirtualTensorArena::new(&device, allocator.clone(), total_addressable, page_size)
-        };
-        
-        // ── 5b. Load and compile quantize shader (binds descriptor set to sparse buffer) ──
-        eprintln!("[CONTROLLER] Creating quantize pipeline...");
-        let (quantize_pipeline, pipeline_layout, set_layout, pool, descriptor_set) =
-            Self::create_quantize_pipeline(&device, arena.sparse_buffer, page_size, total_pages);
-        eprintln!("[CONTROLLER] Pipeline created OK");
-        
-        // ── 6. Instantiate Structural Ecosystem ──
-        let gpu = GpuContext::new(
-            device.clone(),
-            physical_device,
-            queue,
-            queue_family,
-            allocator,
-            command_pool,
-            quantize_pipeline,
-            pipeline_layout,
-            set_layout,
-            pool,
-            descriptor_set,
-        );
-        let cpu = CpuMemoryManager::new();
-        
-        MemoryController {
-            arena,
-            gpu,
-            cpu,
-            max_cpu_bytes: cpu_bytes,
-            used_cpu_bytes: 0,
-            max_vram_bytes: vram_bytes,
-            used_vram_bytes: 0,
-        }
-    }
+		for path in &candidates {
+			if let Ok(bytes) = std::fs::read(path) {
+				eprintln!("[CONTROLLER] loaded quantize shader from {}", path.display());
+				return Some(bytes);
+			}
+		}
+		None
+	}
 
-
-	/// Create the quantize compute pipeline: shader module → descriptor set layout →
-	/// pipeline layout → pipeline → descriptor pool + set binding the sparse buffer.
-	unsafe fn create_quantize_pipeline(
+	/// Build the compute pipeline that quantizes weights in place inside the arena.
+	///
+	/// One storage-buffer binding covers the whole sparse arena — source weights and
+	/// destination bytes are both addressed through it, so the shader sees a single
+	/// flat address space and needs no staging hop. Per-dispatch parameters travel in
+	/// push constants, which keeps the descriptor set immutable across every tensor.
+	fn create_quantize_pipeline(
 		device: &ash::Device,
 		sparse_buffer: vk::Buffer,
 		page_size: vk::DeviceSize,
-		_total_pages: usize,
+		total_pages: usize,
 	) -> (
 		vk::Pipeline,
 		vk::PipelineLayout,
@@ -832,245 +803,425 @@ impl MemoryController {
 		vk::DescriptorPool,
 		vk::DescriptorSet,
 	) {
-		use std::include_bytes;
+		let binding = vk::DescriptorSetLayoutBinding::default()
+			.binding(0)
+			.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+			.descriptor_count(1)
+			.stage_flags(vk::ShaderStageFlags::COMPUTE);
 
-		// ── Load SPIR-V module ──
-		eprintln!("[PIPELINE] Loading SPIR-V bytes...");
-		let spirv_bytes: &[u8] = include_bytes!("../models/compression/quantize_gemv.spv");
-		eprintln!("[PIPELINE] SPIR-V loaded: {} bytes", spirv_bytes.len());
+		let set_layout = unsafe {
+			device
+				.create_descriptor_set_layout(
+					&vk::DescriptorSetLayoutCreateInfo::default()
+						.bindings(std::slice::from_ref(&binding)),
+					None,
+				)
+				.expect("create quantize descriptor set layout")
+		};
 
-		let spirv_words: Vec<u32> = spirv_bytes
-			.chunks_exact(4)
-			.map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-			.collect();
-		eprintln!("[PIPELINE] SPIR-V words: {}", spirv_words.len());
-
-		eprintln!("[PIPELINE] Creating shader module...");
-		let shader_module = device
-			.create_shader_module(
-				&vk::ShaderModuleCreateInfo::default().code(&spirv_words),
-				None,
-			)
-			.expect("create_shader_module");
-		eprintln!("[PIPELINE] Shader module created OK");
-
-		// ── Descriptor set layout: 4 bindings ──
-		let bindings = [
-			vk::DescriptorSetLayoutBinding::default()
-				.binding(0)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.stage_flags(vk::ShaderStageFlags::COMPUTE),
-			vk::DescriptorSetLayoutBinding::default()
-				.binding(1)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.stage_flags(vk::ShaderStageFlags::COMPUTE),
-			vk::DescriptorSetLayoutBinding::default()
-				.binding(2)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.stage_flags(vk::ShaderStageFlags::COMPUTE),
-			vk::DescriptorSetLayoutBinding::default()
-				.binding(3)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.stage_flags(vk::ShaderStageFlags::COMPUTE),
-		];
-		eprintln!("[PIPELINE] Creating descriptor set layout with 4 bindings...");
-		let set_layout = device
-			.create_descriptor_set_layout(
-				&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-				None,
-			)
-			.expect("create_descriptor_set_layout");
-		eprintln!("[PIPELINE] Descriptor set layout created OK");
-
-		// ── Pipeline layout: push constants (COMPUTE_SHADER, offset 0, 8 bytes = 2×u32) ──
-		eprintln!("[PIPELINE] Creating pipeline layout...");
-		let push_range = [vk::PushConstantRange::default()
+		let push_range = vk::PushConstantRange::default()
 			.stage_flags(vk::ShaderStageFlags::COMPUTE)
 			.offset(0)
-			.size(8)]; 
-		let set_layouts = [set_layout];
-		let pipeline_layout = device
-			.create_pipeline_layout(
-				&vk::PipelineLayoutCreateInfo::default()
-					.set_layouts(&set_layouts)
-					.push_constant_ranges(&push_range),
-				None,
-			)
-			.expect("create_pipeline_layout");
-		eprintln!("[PIPELINE] Pipeline layout created OK");
+			.size(std::mem::size_of::<QuantizePushConstants>() as u32);
 
-		// ── Pipeline ──
-		eprintln!("[PIPELINE] Creating compute pipeline...");
-		let entry = std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap();
+		let pipeline_layout = unsafe {
+			device
+				.create_pipeline_layout(
+					&vk::PipelineLayoutCreateInfo::default()
+						.set_layouts(std::slice::from_ref(&set_layout))
+						.push_constant_ranges(std::slice::from_ref(&push_range)),
+					None,
+				)
+				.expect("create quantize pipeline layout")
+		};
+
+		let pool_size = vk::DescriptorPoolSize::default()
+			.ty(vk::DescriptorType::STORAGE_BUFFER)
+			.descriptor_count(1);
+
+		let descriptor_pool = unsafe {
+			device
+				.create_descriptor_pool(
+					&vk::DescriptorPoolCreateInfo::default()
+						.max_sets(1)
+						.pool_sizes(std::slice::from_ref(&pool_size)),
+					None,
+				)
+				.expect("create quantize descriptor pool")
+		};
+
+		let descriptor_set = unsafe {
+			device
+				.allocate_descriptor_sets(
+					&vk::DescriptorSetAllocateInfo::default()
+						.descriptor_pool(descriptor_pool)
+						.set_layouts(std::slice::from_ref(&set_layout)),
+				)
+				.expect("allocate quantize descriptor set")[0]
+		};
+
+		// Bind the entire arena. The buffer is sparse, so this range is only backed
+		// where pages have actually been committed.
+		let arena_bytes = page_size * total_pages as vk::DeviceSize;
+		let buffer_info = vk::DescriptorBufferInfo::default()
+			.buffer(sparse_buffer)
+			.offset(0)
+			.range(if arena_bytes == 0 {
+				vk::WHOLE_SIZE
+			} else {
+				arena_bytes
+			});
+
+		unsafe {
+			device.update_descriptor_sets(
+				&[vk::WriteDescriptorSet::default()
+					.dst_set(descriptor_set)
+					.dst_binding(0)
+					.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+					.buffer_info(std::slice::from_ref(&buffer_info))],
+				&[],
+			);
+		}
+
+		// The shader artifact is optional at build time; without it the pipeline
+		// handle stays null and quantize_gpu() refuses to dispatch.
+		let spirv = match Self::find_quantize_spirv() {
+			Some(bytes) => bytes,
+			None => {
+				eprintln!(
+					"[CONTROLLER] sandbag_quantize.spv not found — GPU quantize disabled. \
+					 Compile it with: glslangValidator --target-env vulkan1.3 -o \
+					 src/models/sandbag_quantize.spv src/models/sandbag_quantize.comp"
+				);
+				return (
+					vk::Pipeline::null(),
+					pipeline_layout,
+					set_layout,
+					descriptor_pool,
+					descriptor_set,
+				);
+			}
+		};
+
+		let words: Vec<u32> = spirv
+			.chunks_exact(4)
+			.map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+			.collect();
+
+		let shader_module = unsafe {
+			device
+				.create_shader_module(
+					&vk::ShaderModuleCreateInfo::default().code(&words),
+					None,
+				)
+				.expect("create quantize shader module")
+		};
+
+		let entry_name = c"main";
 		let stage = vk::PipelineShaderStageCreateInfo::default()
 			.stage(vk::ShaderStageFlags::COMPUTE)
 			.module(shader_module)
-			.name(entry);
-		let pipeline_create_info = vk::ComputePipelineCreateInfo::default()
-			.stage(stage)
-			.layout(pipeline_layout);
-		let pipeline = device
-			.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_create_info], None)
-			.expect("create_compute_pipelines")[0];
-		eprintln!("[PIPELINE] Compute pipeline created OK");
+			.name(entry_name);
 
-		// ── Descriptor pool: 4 bindings/set × 64 sets = 256 descriptors ──
-		eprintln!("[PIPELINE] Creating descriptor pool (256 slots)...");
-		let pool_sizes = [vk::DescriptorPoolSize {
-			ty: vk::DescriptorType::STORAGE_BUFFER,
-			descriptor_count: 256,
-		}];
-		let pool = device
-			.create_descriptor_pool(
-				&vk::DescriptorPoolCreateInfo::default()
-					.max_sets(64)
-					.flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-					.pool_sizes(&pool_sizes),
-				None,
-			)
-			.expect("create_descriptor_pool");
-		eprintln!("[PIPELINE] Descriptor pool created OK");
+		let pipeline = unsafe {
+			device
+				.create_compute_pipelines(
+					vk::PipelineCache::null(),
+					&[vk::ComputePipelineCreateInfo::default()
+						.stage(stage)
+						.layout(pipeline_layout)],
+					None,
+				)
+				.expect("create quantize compute pipeline")[0]
+		};
 
-		// ── Allocate descriptor set ──
-		eprintln!("[PIPELINE] Allocating descriptor set...");
-		let descriptor_set = device
-			.allocate_descriptor_sets(
-				&vk::DescriptorSetAllocateInfo::default()
-					.descriptor_pool(pool)
-					.set_layouts(&[set_layout]),
-			)
-			.expect("allocate_descriptor_sets")[0];
-		eprintln!("[PIPELINE] Descriptor set allocated OK");
+		// The module is baked into the pipeline; the handle is no longer needed.
+		unsafe { device.destroy_shader_module(shader_module, None) };
 
-		let binding0_offset = 0;
-		let binding0_range  = page_size * 100; // Example: SourceWeights takes 100 pages
-
-		let binding1_offset = binding0_offset + binding0_range;
-		let binding1_range  = page_size * 50;  // Example: GpuWorkPool takes 50 pages
-
-		let binding2_offset = binding1_offset + binding1_range;
-		let binding2_range  = page_size * 10;  // Example: GlobalCounters takes 10 pages
-
-		let binding3_offset = binding2_offset + binding2_range;
-		let binding3_range  = vk::WHOLE_SIZE;  // Remainder goes to BucketData
-
-		// Define specific descriptor buffers details per binding slot
-		let info_binding0 = vk::DescriptorBufferInfo::default()
-			.buffer(sparse_buffer).offset(binding0_offset).range(binding0_range);
-
-		let info_binding1 = vk::DescriptorBufferInfo::default()
-			.buffer(sparse_buffer).offset(binding1_offset).range(binding1_range);
-
-		let info_binding2 = vk::DescriptorBufferInfo::default()
-			.buffer(sparse_buffer).offset(binding2_offset).range(binding2_range);
-
-		let info_binding3 = vk::DescriptorBufferInfo::default()
-			.buffer(sparse_buffer).offset(binding3_offset).range(binding3_range);
-
-		let desc_writers = [
-			vk::WriteDescriptorSet::default()
-				.dst_set(descriptor_set)
-				.dst_binding(0)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.buffer_info(std::slice::from_ref(&info_binding0)),
-			vk::WriteDescriptorSet::default()
-				.dst_set(descriptor_set)
-				.dst_binding(1)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.buffer_info(std::slice::from_ref(&info_binding1)),
-			vk::WriteDescriptorSet::default()
-				.dst_set(descriptor_set)
-				.dst_binding(2)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.buffer_info(std::slice::from_ref(&info_binding2)),
-			vk::WriteDescriptorSet::default()
-				.dst_set(descriptor_set)
-				.dst_binding(3)
-				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-				.descriptor_count(1)
-				.buffer_info(std::slice::from_ref(&info_binding3)),
-		];
-		
-		unsafe { device.update_descriptor_sets(&desc_writers, &[]); }
-		eprintln!("[PIPELINE] Descriptor set bound to sparse buffer subdivisions OK");
-
-		device.destroy_shader_module(shader_module, None);
-		(pipeline, pipeline_layout, set_layout, pool, descriptor_set)
+		(
+			pipeline,
+			pipeline_layout,
+			set_layout,
+			descriptor_pool,
+			descriptor_set,
+		)
 	}
 
-	// ── Block paging (work-stealing threadpool) ────────────────────────────
+	// /// Dynamically inspects the host OS and Vulkan physical device to initialize the arena
+	// /// with zero hardcoded constraints.
+	// /// The `device` parameter may have been created from an instance that is already dropped;
+	// /// we reload its function pointers via vkGetDeviceProcAddr so they remain valid.
+	// pub unsafe fn initialize_controller_from_hardware(
+	// 	instance: &ash::Instance,
+	// 	physical_device: vk::PhysicalDevice,
+	// 	device: ash::Device,
+	// 	queue: vk::Queue,
+	// 	allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+	// ) -> MemoryController {
+	// 	// ── 0. Reload device function pointers independently of the instance ──
+	// 	// The `device` was created by instance.create_device(), which loaded VFNs via
+	// 	// vkGetInstanceProcAddr. If the Instance is dropped (e.g. init_gpu() returns),
+	// 	// those tables may dangle. Reload with vkGetDeviceProcAddr instead.
+	// 	let raw_device = device.handle();
+	// 	let entry = unsafe { ash::Entry::load() }.expect("load Entry");
+	// 	// Re-create a Device that owns its own VFN table (survives instance drop).
+	// 	// vkGetInstanceProcAddr with a null instance is valid per the Vulkan spec
+	// 	// and returns device-local function pointers.
 
-	/// Submit a batch of model blocks for paging into the arena.
+
+	// 	eprintln!("[CONTROLLER] initialize_controller_from_hardware START");
+
+	// 	// ── 1. Query OS for Available System Memory (CPU) ──
+	// 	let mut sys = System::new_all();
+	// 	sys.refresh_memory();
+	// 	let cpu_bytes = sys.available_memory();
+	// 	eprintln!("[CONTROLLER] CPU available: {} bytes", cpu_bytes);
+
+	// 	// ── 2. Query Vulkan Device for Device-Local Memory (VRAM) ──
+	// 	let mem_properties =
+	// 		unsafe { instance.get_physical_device_memory_properties(physical_device) };
+	// 	let mut vram_bytes = 0u64;
+	// 	for i in 0..mem_properties.memory_heap_count as usize {
+	// 		let heap = mem_properties.memory_heaps[i];
+	// 		if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+	// 			vram_bytes = vram_bytes.max(heap.size);
+	// 		}
+	// 	}
+	// 	eprintln!("[CONTROLLER] VRAM: {} bytes", vram_bytes);
+
+	// 	// ── 3. Resolve queue family for command pool ──
+	// 	let queue_family_props =
+	// 		unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+	// 	let queue_family = queue_family_props
+	// 		.iter()
+	// 		.position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+	// 		.unwrap_or_else(|| {
+	// 			queue_family_props
+	// 				.iter()
+	// 				.position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+	// 				.expect("No suitable queue family")
+	// 		}) as u32;
+
+	// 	// ── 4. Create persistent command pool ──
+	// 	let command_pool = unsafe {
+	// 		device
+	// 			.create_command_pool(
+	// 				&vk::CommandPoolCreateInfo::default()
+	// 					.flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+	// 					.queue_family_index(queue_family),
+	// 				None,
+	// 			)
+	// 			.expect("Failed to create command pool")
+	// 	};
+
+	// 	// ── 5. Calculate Arena Layout Constraints ──
+	// 	let reserved = 4_000_000_000u64;
+	// 	let total_addressable = (cpu_bytes + vram_bytes).saturating_sub(reserved);
+	// 	let page_size: vk::DeviceSize = 64 * 1024; // 64 KiB pages
+	// 	let total_pages = (total_addressable / page_size) as usize;
+
+	// 	// ── 5a. Create the sparse buffer arena first (pipeline needs its handle) ──
+	// 	let arena = unsafe {
+	// 		VirtualTensorArena::new(&device, allocator.clone(), total_addressable, page_size)
+	// 	};
+
+	// 	// ── 5b. Load and compile quantize shader (binds descriptor set to sparse buffer) ──
+	// 	eprintln!("[CONTROLLER] Creating quantize pipeline...");
+	// 	let (quantize_pipeline, pipeline_layout, set_layout, pool, descriptor_set) =
+	// 		Self::create_quantize_pipeline(&device, arena.sparse_buffer, page_size, total_pages);
+	// 	eprintln!("[CONTROLLER] Pipeline created OK");
+
+	// 	// ── 6. Instantiate Structural Ecosystem ──
+	// 	let gpu = GpuContext::new(
+	// 		device.clone(),
+	// 		physical_device,
+	// 		queue,
+	// 		queue_family,
+	// 		allocator,
+	// 		command_pool,
+	// 		quantize_pipeline,
+	// 		pipeline_layout,
+	// 		set_layout,
+	// 		pool,
+	// 		descriptor_set,
+	// 	);
+	// 	let cpu = CpuMemoryManager::new();
+
+	// 	MemoryController {
+	// 		arena,
+	// 		gpu,
+	// 		cpu,
+	// 		max_cpu_bytes: cpu_bytes,
+	// 		used_cpu_bytes: 0,
+	// 		max_vram_bytes: vram_bytes,
+	// 		used_vram_bytes: 0,
+	// 	}
+	// }
+
+
+
+/// The `device` parameter may have been created from an instance that is already dropped;
+/// we reload its function pointers via vkGetDeviceProcAddr so they remain valid.
+pub unsafe fn initialize_controller_from_hardware(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    queue: vk::Queue,
+    allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+) -> MemoryController {
+    eprintln!("[CONTROLLER] initialize_controller_from_hardware START");
+
+    // ── 1. Query OS for Available System Memory (CPU) ──
+    let mut sys = System::new_all();
+    sys.refresh_memory();
+    let cpu_bytes = sys.available_memory();
+    eprintln!("[CONTROLLER] CPU available: {} bytes", cpu_bytes);
+
+    // ── 2. Query Vulkan Device for Device-Local Memory (VRAM) ──
+    // Fully safe now because `instance` is guaranteed to be alive
+    let mem_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let mut vram_bytes = 0u64;
+    for i in 0..mem_properties.memory_heap_count as usize {
+        let heap = mem_properties.memory_heaps[i];
+        if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+            vram_bytes = vram_bytes.max(heap.size);
+        }
+    }
+    eprintln!("[CONTROLLER] VRAM: {} bytes", vram_bytes);
+
+    // ── 3. Resolve queue family for command pool ──
+    let queue_family_props =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let queue_family = queue_family_props
+        .iter()
+        .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
+        .unwrap_or_else(|| {
+            queue_family_props
+                .iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+                .expect("No suitable queue family")
+        }) as u32;
+
+    // ── 4. Create persistent command pool ──
+    let command_pool = unsafe {
+        device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                    .queue_family_index(queue_family),
+                None,
+            )
+            .expect("Failed to create command pool")
+    };
+
+    // ── 5. Calculate Arena Layout Constraints ──
+    let reserved = 4_000_000_000u64;
+    let total_addressable = (cpu_bytes + vram_bytes).saturating_sub(reserved);
+    let page_size: vk::DeviceSize = 64 * 1024; // 64 KiB pages
+    let total_pages = (total_addressable / page_size) as usize;
+
+    // ── 5a. Create the sparse buffer arena first ──
+    let arena = unsafe {
+        VirtualTensorArena::new(&device, allocator.clone(), total_addressable, page_size)
+    };
+
+    // ── 5b. Load and compile quantize shader ──
+    eprintln!("[CONTROLLER] Creating quantize pipeline...");
+    let (quantize_pipeline, pipeline_layout, set_layout, pool, descriptor_set) =
+        Self::create_quantize_pipeline(&device, arena.sparse_buffer, page_size, total_pages);
+    eprintln!("[CONTROLLER] Pipeline created OK");
+
+    // ── 6. Instantiate Structural Ecosystem ──
+    let gpu = GpuContext::new(
+        device,
+				physical_device,
+        queue,
+				queue_family,
+				allocator,
+        command_pool,
+        quantize_pipeline,
+        pipeline_layout,
+        set_layout,
+        pool,
+        descriptor_set,
+    );
+    let cpu = CpuMemoryManager::new();
+
+    MemoryController {
+        arena,
+        gpu,
+        cpu,
+        max_cpu_bytes: cpu_bytes,
+        used_cpu_bytes: 0,
+        max_vram_bytes: vram_bytes,
+        used_vram_bytes: 0,
+    }
+}
+
+
+	/// Page a batch of model blocks into the arena, back to back.
 	///
-	/// Each block is described by `(offset, size)` — offset within the source
-	/// model file, size in bytes. Blocks are distributed across a rayon threadpool
-	/// (work-stealing scheduler). Each block is written to its assigned page slot.
+	/// `src` is the whole source model (typically an mmap of the file); each
+	/// block names a byte range within it.
 	///
-	/// Page assignment: block `i` → page `i` (linear mapping).
-	/// Blocks larger than one page are split across consecutive pages.
-	pub fn submit_blocks_for_paging(&mut self, blocks: &[BlockDescriptor]) {
+	/// Blocks are concatenated into one contiguous byte stream before being cut
+	/// into pages, so a page may straddle a block boundary and only the final
+	/// page of the whole model is zero-padded. This is load-bearing: the arena
+	/// offset of block *n* must equal the sum of the sizes of blocks 0..n, or
+	/// tensors no longer sit where the sequential layout says they do.
+	///
+	/// Returns the number of bytes paged in.
+	pub fn submit_blocks_for_paging(
+		&mut self,
+		src: &[u8],
+		blocks: &[BlockDescriptor],
+	) -> Result<u64, String> {
 		use rayon::prelude::*;
 
-		let page_size = self.arena.page_size as u64;
+		let page_size = self.arena.page_size as usize;
 		let total_pages = self.arena.total_pages;
 
-		// Build a flat list of (page_index, data) tasks.
-		// Blocks that span multiple pages are split.
-		let mut tasks: Vec<(usize, Vec<u8>)> = Vec::new();
-		let mut next_page = 0usize;
-
-		for block in blocks {
-			let block_size = block.size as usize;
-			let block_offset = block.offset as usize;
-			let bytes = self.read_model_block(block.offset, block.size);
-
-			let mut pos = 0usize;
-			while pos < bytes.len() && next_page < total_pages {
-				let remaining = bytes.len() - pos;
-				let chunk_size = remaining.min(page_size as usize);
-				let end = pos + chunk_size;
-
-				// Pad the last chunk of a block to page_size if needed
-				let chunk = if end == bytes.len() && remaining < page_size as usize {
-					let mut padded = vec![0u8; page_size as usize];
-					padded[..remaining].copy_from_slice(&bytes[pos..]);
-					padded
-				} else {
-					bytes[pos..end].to_vec()
-				};
-
-				tasks.push((next_page, chunk));
-				next_page += 1;
-				pos = end;
-			}
+		let total_bytes: u64 = blocks.iter().map(|b| b.size).sum();
+		let pages_needed = (total_bytes as usize).div_ceil(page_size);
+		if pages_needed > total_pages {
+			return Err(format!(
+				"Model needs {} pages ({} bytes) but the arena only has {}",
+				pages_needed, total_bytes, total_pages
+			));
 		}
 
-		// Parallel write via rayon work-stealing pool.
-		// Each task writes to its page; the controller handles residency routing.
-		let controller = Arc::new(Mutex::new(self.clone_for_parallel()));
-		tasks.into_par_iter().for_each(|(page_idx, data)| {
-			let mut ctrl = controller.lock().unwrap();
-			ctrl.write_page(page_idx, &data);
-		});
+		let tasks = plan_pages(src, blocks, page_size)?;
+
+		// Commit before writing. `write_page` only uploads to the sparse buffer for
+		// pages that are already GpuResident; an Unmapped page is routed to CPU RAM
+		// instead, which leaves the shader reading unbacked memory as zeros.
+		for (page_idx, _) in &tasks {
+			self.commit_page(*page_idx);
+		}
+
+		// Serial, deliberately. A GpuResident page upload allocates a command
+		// buffer from `gpu.command_pool` and submits to `gpu.queue` — both are
+		// externally-synchronized Vulkan objects, so driving them from several
+		// rayon workers at once is undefined behaviour, not a speedup. The earlier
+		// parallel version survived only while models were small enough to fit a
+		// single page; at 32+ pages it took the process down mid-upload.
+		//
+		// The uploads all funnel through one queue anyway, so there was no real
+		// concurrency to win here. Parallelism belongs in the encode path, where
+		// `quantize_cpu` already uses it.
+		for (page_idx, data) in tasks {
+			self.write_page(page_idx, &data);
+		}
+
+		Ok(total_bytes)
 	}
 
-	/// Read a block from the source model. Placeholder — wire to real loader.
-	fn read_model_block(&self, _offset: u64, _size: u64) -> Vec<u8> {
-		// TODO: mmap the model file and read the block
-		vec![0u8; _size as usize]
-	}
 
 	/// Clone just enough state for parallel page writes.
-	fn clone_for_parallel(&self) -> MemoryController {
+	pub fn clone_for_parallel(&self) -> MemoryController {
 		Self {
-			arena: self.arena.clone_shallow(),
+			arena: self.arena.clone(),
 			gpu: self.gpu.clone_shallow(),
 			cpu: CpuMemoryManager::new(),
 			max_cpu_bytes: self.max_cpu_bytes,
@@ -1081,8 +1232,73 @@ impl MemoryController {
 	}
 }
 
+/// Copy one block out of the source model, bounds-checked.
+///
+/// Errors rather than returning zeros: a buffer of zeros is indistinguishable from
+/// real weights downstream and quantizes into a plausible-looking file.
+fn read_model_block(src: &[u8], offset: u64, size: u64) -> Result<&[u8], String> {
+	let start = offset as usize;
+	let end = start
+		.checked_add(size as usize)
+		.ok_or_else(|| format!("Block offset {} + size {} overflows", offset, size))?;
+	src.get(start..end).ok_or_else(|| {
+		format!(
+			"Block [{}, {}) is outside the {}-byte source model",
+			start,
+			end,
+			src.len()
+		)
+	})
+}
 
+/// Cut the concatenation of `blocks` into page-sized writes.
+///
+/// The blocks are treated as one contiguous stream, so a page may straddle a block
+/// boundary and only the last page is zero-padded. Keeping interior boundaries
+/// unpadded is what makes an arena offset equal a model offset.
+fn plan_pages(
+	src: &[u8],
+	blocks: &[BlockDescriptor],
+	page_size: usize,
+) -> Result<Vec<(usize, Vec<u8>)>, String> {
+	let mut tasks: Vec<(usize, Vec<u8>)> = Vec::new();
+	let mut next_page = 0usize;
+	let mut carry: Vec<u8> = Vec::with_capacity(page_size);
 
+	for block in blocks {
+		let bytes = read_model_block(src, block.offset, block.size)?;
+
+		let mut pos = 0usize;
+		while pos < bytes.len() {
+			let need = page_size - carry.len();
+			let take = need.min(bytes.len() - pos);
+			carry.extend_from_slice(&bytes[pos..pos + take]);
+			pos += take;
+
+			if carry.len() == page_size {
+				tasks.push((next_page, std::mem::take(&mut carry)));
+				carry.reserve(page_size);
+				next_page += 1;
+			}
+		}
+	}
+
+	// Only the tail of the model is padded — never an interior boundary.
+	if !carry.is_empty() {
+		carry.resize(page_size, 0);
+		tasks.push((next_page, carry));
+	}
+
+	Ok(tasks)
+}
+
+/// Rayon's `for_each_with` needs an owned handle per worker. Cloning shares the
+/// arena and the Vulkan handles while giving each worker its own CPU accounting.
+impl Clone for MemoryController {
+	fn clone(&self) -> Self {
+		self.clone_for_parallel()
+	}
+}
 
 /// GPU buffer layout matching TensorArenaArchitecture.pdf spec.
 ///
@@ -1098,14 +1314,18 @@ impl MemoryController {
 
 /// Initialize the global MemoryController from Vulkan hardware.
 /// Must be called once before any gpu_quantize() calls.
-/// Returns true if initialized, false if already initialized.
+/// `entry` keeps libvulkan loaded; if it drops the device VFN table dangles.
 pub fn init_global_controller(
+	entry: ash::Entry,
 	instance: &ash::Instance,
 	physical_device: ash::vk::PhysicalDevice,
 	device: ash::Device,
 	queue: ash::vk::Queue,
 	allocator: Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
 ) -> Result<(), String> {
+	// Pin the Entry so libvulkan.so never unloads while this process is alive.
+	GLOBAL_ENTRY.set(entry).map_err(|_| "Entry already initialized".to_string())?;
+
 	let ctrl = unsafe {
 		MemoryController::initialize_controller_from_hardware(
 			instance,
@@ -1120,5 +1340,113 @@ pub fn init_global_controller(
 		.map_err(|_| "Global controller already initialized".to_string())
 }
 
+/// Global Vulkan Entry — keeps libvulkan loaded while the process is alive.
+/// Dropping this would unload the library and invalidate every device VFN.
+pub static GLOBAL_ENTRY: OnceLock<ash::Entry> = OnceLock::new();
+
 /// Global MemoryController — initialized once by init_global_controller().
 pub static GLOBAL_CONTROLLER: OnceLock<Arc<Mutex<MemoryController>>> = OnceLock::new();
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// Flatten a page plan back into the arena's byte image.
+	fn arena_image(tasks: &[(usize, Vec<u8>)], page_size: usize) -> Vec<u8> {
+		let mut out = vec![0u8; tasks.len() * page_size];
+		for (page_idx, data) in tasks {
+			let start = page_idx * page_size;
+			out[start..start + data.len()].copy_from_slice(data);
+		}
+		out
+	}
+
+	/// The invariant the whole format rests on: a block's arena offset is the sum
+	/// of the sizes of the blocks before it. No interior padding, no reordering.
+	#[test]
+	fn blocks_land_at_their_running_sum_offset() {
+		let page_size = 64;
+		// Sizes deliberately not multiples of the page size.
+		let sizes: [u64; 4] = [100, 30, 77, 5];
+
+		// Each block gets its own byte value so misplacement is visible.
+		let mut src = Vec::new();
+		let mut blocks = Vec::new();
+		for (i, &size) in sizes.iter().enumerate() {
+			blocks.push(BlockDescriptor {
+				offset: src.len() as u64,
+				size,
+			});
+			src.extend(std::iter::repeat_n(b'A' + i as u8, size as usize));
+		}
+
+		let tasks = plan_pages(&src, &blocks, page_size).expect("plan");
+		let image = arena_image(&tasks, page_size);
+
+		let mut expected_offset = 0usize;
+		for (i, &size) in sizes.iter().enumerate() {
+			let tag = b'A' + i as u8;
+			let got = &image[expected_offset..expected_offset + size as usize];
+			assert!(
+				got.iter().all(|&b| b == tag),
+				"block {} is not contiguous at offset {}",
+				i,
+				expected_offset
+			);
+			expected_offset += size as usize;
+		}
+
+		// The arena image is byte-identical to the concatenated source.
+		assert_eq!(&image[..src.len()], &src[..]);
+	}
+
+	#[test]
+	fn only_the_final_page_is_padded() {
+		let page_size = 64;
+		let src = vec![0xABu8; 200];
+		let blocks = [BlockDescriptor {
+			offset: 0,
+			size: 200,
+		}];
+
+		let tasks = plan_pages(&src, &blocks, page_size).expect("plan");
+		assert_eq!(tasks.len(), 200usize.div_ceil(page_size));
+
+		let image = arena_image(&tasks, page_size);
+		assert!(image[..200].iter().all(|&b| b == 0xAB));
+		// 200 = 3 pages + 8 bytes; the tail of the last page is the only padding.
+		assert!(image[200..].iter().all(|&b| b == 0));
+	}
+
+	#[test]
+	fn pages_are_numbered_consecutively_from_zero() {
+		let page_size = 16;
+		let src = vec![1u8; 100];
+		let blocks = [
+			BlockDescriptor {
+				offset: 0,
+				size: 40,
+			},
+			BlockDescriptor {
+				offset: 40,
+				size: 60,
+			},
+		];
+
+		let tasks = plan_pages(&src, &blocks, page_size).expect("plan");
+		for (i, (page_idx, data)) in tasks.iter().enumerate() {
+			assert_eq!(*page_idx, i, "page indices must be dense and ordered");
+			assert_eq!(data.len(), page_size, "every write is exactly one page");
+		}
+	}
+
+	#[test]
+	fn out_of_range_block_is_an_error_not_zeros() {
+		let src = vec![0u8; 10];
+		let blocks = [BlockDescriptor {
+			offset: 8,
+			size: 99,
+		}];
+		assert!(plan_pages(&src, &blocks, 64).is_err());
+	}
+}

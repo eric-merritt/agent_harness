@@ -14,8 +14,8 @@ pub struct KvCache {
 }
 
 impl KvCache {
-	pub fn max_seq_len(&self) {
-		&self.max_seq_len;
+	pub fn max_seq_len(&self) -> usize {
+		self.max_seq_len
 	}
 	/// Allocate a KV cache sized for the given model config.
 	pub fn new(config: &ModelConfig) -> Self {
@@ -58,6 +58,22 @@ impl KvCache {
 		let base = h * self.head_dim * self.max_seq_len;
 		for d in 0..self.head_dim {
 			self.v[base + d * self.max_seq_len + pos] = v_head[d];
+		}
+	}
+
+	/// Read K for KV-head `h` at sequence position `p` into the supplied buffer.
+	pub fn read_k(&self, h: usize, p: usize, out: &mut [f32]) {
+		let base = h * self.head_dim * self.max_seq_len;
+		for d in 0..self.head_dim {
+			out[d] = self.k[base + d * self.max_seq_len + p];
+		}
+	}
+
+	/// Read V for KV-head `h` at sequence position `p` into the supplied buffer.
+	pub fn read_v(&self, h: usize, p: usize, out: &mut [f32]) {
+		let base = h * self.head_dim * self.max_seq_len;
+		for d in 0..self.head_dim {
+			out[d] = self.v[base + d * self.max_seq_len + p];
 		}
 	}
 }

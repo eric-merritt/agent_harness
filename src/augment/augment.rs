@@ -1,17 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-
-
-
-
-impl Graph {
-	pub fn new(id: Uuid, nodes: Vec<Node>, edges: Vec<Edge>) -> Self {
-		Self { id, nodes, edges }
-	}
-}
-
-// ── Prompt building blocks ─────────────────────────────────────────────────────
+// Re-export Graph types from graphs/graph.rs
+pub use super::graphs::{Edge, Graph, Node};
 
 /// A conditional rule attached to a prompt block.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,65 +27,6 @@ pub struct Example {
 	pub input: String,
 	pub output: String,
 	pub is_active: bool,
-}
-
-/// A context snippet — codebase tidbit, doc excerpt, or factual note.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContextSnippet {
-	pub id: Uuid,
-	pub content: String,
-	pub source: String,
-	pub token_estimate: usize,
-	pub is_active: bool,
-}
-
-/// An atomic piece of a prompt.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum PromptBlock {
-	Rule(Rule),
-	PersonalityTrait(PersonalityTrait),
-	Example(Example),
-	ContextSnippet(ContextSnippet),
-}
-
-/// A composed system prompt built from active prompt blocks.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SystemPrompt {
-	pub blocks: Vec<PromptBlock>,
-}
-
-impl SystemPrompt {
-	/// Render the active blocks into a single string for the API call.
-	pub fn render(&self) -> String {
-		let mut out = String::new();
-		for block in &self.blocks {
-			let active = match block {
-				PromptBlock::Rule(r) => r.is_active,
-				PromptBlock::PersonalityTrait(p) => p.is_active,
-				PromptBlock::Example(e) => e.is_active,
-				PromptBlock::ContextSnippet(c) => c.is_active,
-			};
-			if !active {
-				continue;
-			}
-			match block {
-				PromptBlock::Rule(r) => {
-					out.push_str(&format!("Rule: {}\n", r.content));
-				}
-				PromptBlock::PersonalityTrait(p) => {
-					out.push_str(&format!("Trait: {}\n", p.content));
-				}
-				PromptBlock::Example(e) => {
-					out.push_str(&format!("Input: {}\nOutput: {}\n", e.input, e.output));
-				}
-				PromptBlock::ContextSnippet(c) => {
-					out.push_str(&format!("Context ({}): {}\n", c.source, c.content));
-				}
-			}
-		}
-		out
-	}
 }
 
 // ── Attachment ─────────────────────────────────────────────────────────────────
@@ -620,7 +552,7 @@ impl AblationPipeline {
 
 // ── Compressed model weights ──────────────────────────────────────────────────
 
-/// Compressed model weights in DedupCountTensor format.
+/// Compressed model weights in CompressedTensor format.
 /// Plugged into the AugmentBus to provide on-demand weight decompression.
 ///
 /// The actual weight data lives in two sidecar files:
@@ -645,6 +577,32 @@ pub struct CompressedModelAugment {
 	/// Core compression ratio (original / core).
 	pub core_ratio: f32,
 	pub is_active: bool,
+}
+
+/// A single block of prompt text that can be injected into the conversation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptBlock {
+	pub id: Uuid,
+	pub content: String,
+	pub position: PromptPosition,
+	pub is_active: bool,
+}
+
+/// Position where the prompt block is injected.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum PromptPosition {
+	#[default]
+	Prepend,
+	Append,
+	System,
+}
+
+/// A system-level prompt that controls model behavior globally.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SystemPrompt {
+	pub id: Uuid,
+	pub content: String,
+	pub priority: u32, // lower = higher priority (inserted first)
 }
 
 // ── Top-level augment enum ─────────────────────────────────────────────────────

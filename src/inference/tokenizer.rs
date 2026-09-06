@@ -9,7 +9,7 @@
 // Decode reverses the process: token ID → vocab string → reverse byte mapping
 // → UTF-8 decode.
 
-use crate::models::formats::gguf::{GGUFFile, GGUFValue};
+use crate::models::format::{GgufHeader, GgufValue};
 use std::collections::HashMap;
 
 /// Serializable raw tokenizer data for storing to disk.
@@ -62,17 +62,16 @@ pub struct Tokenizer {
 
 impl Tokenizer {
 	/// Build a Tokenizer from GGUF metadata.
-	pub fn from_gguf(gguf: &GGUFFile) -> Self {
+	pub fn from_gguf(gguf: &GgufHeader) -> Self {
 		// Extract a string array from GGUF KV metadata.
 		let get_string_array = |key: &str| -> Vec<String> {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::Array(arr) => Some(
-						arr.data
-							.iter()
+					GgufValue::Array(arr) => Some(
+						arr.iter()
 							.filter_map(|item| {
-								if let GGUFValue::String(s) = item {
+								if let GgufValue::String(s) = item {
 									Some(s.clone())
 								} else {
 									None
@@ -90,12 +89,11 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::Array(arr) => Some(
-						arr.data
-							.iter()
+					GgufValue::Array(arr) => Some(
+						arr.iter()
 							.filter_map(|item| match item {
-								GGUFValue::U32(v) => Some(*v),
-								GGUFValue::U64(v) => Some(*v as u32),
+								GgufValue::Uint32(v) => Some(*v),
+								GgufValue::Uint64(v) => Some(*v as u32),
 								_ => None,
 							})
 							.collect(),
@@ -110,8 +108,8 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::U32(v) => Some(*v),
-					GGUFValue::U64(v) => Some(*v as u32),
+					GgufValue::Uint32(v) => Some(*v),
+					GgufValue::Uint64(v) => Some(*v as u32),
 					_ => None,
 				})
 				.unwrap_or(0)
@@ -158,12 +156,12 @@ impl Tokenizer {
 	}
 
 	/// Extract raw tokenizer data from a GGUF file.
-	pub fn extract_data(gguf: &GGUFFile) -> TokenizerData {
+	pub fn extract_data(gguf: &GgufHeader) -> TokenizerData {
 		let get_string = |key: &str| -> String {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::String(s) => Some(s.clone()),
+					GgufValue::String(s) => Some(s.clone()),
 					_ => None,
 				})
 				.unwrap_or_default()
@@ -172,8 +170,8 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::U32(v) => Some(*v),
-					GGUFValue::U64(v) => Some(*v as u32),
+					GgufValue::Uint32(v) => Some(*v),
+					GgufValue::Uint64(v) => Some(*v as u32),
 					_ => None,
 				})
 				.unwrap_or(0)
@@ -182,11 +180,10 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::Array(arr) => Some(
-						arr.data
-							.iter()
+					GgufValue::Array(arr) => Some(
+						arr.iter()
 							.filter_map(|item| {
-								if let GGUFValue::String(s) = item {
+								if let GgufValue::String(s) = item {
 									Some(s.clone())
 								} else {
 									None
@@ -202,12 +199,11 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::Array(arr) => Some(
-						arr.data
-							.iter()
+					GgufValue::Array(arr) => Some(
+						arr.iter()
 							.filter_map(|item| match item {
-								GGUFValue::U32(v) => Some(*v),
-								GGUFValue::U64(v) => Some(*v as u32),
+								GgufValue::Uint32(v) => Some(*v),
+								GgufValue::Uint64(v) => Some(*v as u32),
 								_ => None,
 							})
 							.collect(),
@@ -355,7 +351,7 @@ impl Tokenizer {
 	}
 
 	pub fn extract_to_file(
-		gguf: &GGUFFile,
+		gguf: &GgufHeader,
 		dir: &std::path::Path,
 	) -> Result<(), Box<dyn std::error::Error>> {
 		let data = Self::extract_data(gguf);

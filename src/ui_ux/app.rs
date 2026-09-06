@@ -16,7 +16,7 @@ use crate::inference::progress::LoadingProgress;
 use crate::messaging::chat_interface::ChatInterface;
 use crate::messaging::layout::DefaultLayout;
 use crate::messaging::mcp_config::{McpConfig, SavedMcpServer};
-use crate::models::server::ModelServer;
+// use crate::models::server::ModelServer;
 use crate::ui_ux::components::loading_modal::render_loading_modal;
 use crate::ui_ux::components::mcp_modal::{ConfigState, McpModal, ModalAction};
 use crate::ui_ux::components::mcp_panel::{McpPanel, McpToolNode};
@@ -33,16 +33,16 @@ pub struct App {
 	mcp_modal: McpModal,
 	/// Server info to add to MCP panel after successful connection test.
 	pending_mcp_server: Arc<RwLock<Option<(String, String, String, usize)>>>,
-	/// Compressed model server (if a model was detected on startup).
-	model_server: Option<Arc<ModelServer>>,
+	// Compressed model server (if a model was detected on startup).
+	// model_server: Option<Arc<ModelServer>>,
 	/// Last-known layout areas (set during render, used for mouse hit-testing).
 	last_areas: Option<DefaultLayout>,
 	/// Model loading progress tracker — when Some, the loading modal is shown.
 	loading_progress: Option<LoadingProgress>,
 	/// When loading started — used to enforce minimum modal display time.
 	loading_started: Option<std::time::Instant>,
-	/// Shared slot for the model server being loaded in background.
-	loading_server: Arc<RwLock<Option<Arc<ModelServer>>>>,
+	// Shared slot for the model server being loaded in background.
+	// loading_server: Arc<RwLock<Option<Arc<ModelServer>>>>,
 }
 
 impl App {
@@ -55,7 +55,7 @@ impl App {
 		let mut mcp_panel = McpPanel::new();
 		let dirty = Arc::new(AtomicBool::new(true));
 		let mcp_modal = McpModal::new();
-		let loading_server: Arc<RwLock<Option<Arc<ModelServer>>>> = Arc::new(RwLock::new(None));
+		// let loading_server: Arc<RwLock<Option<Arc<ModelServer>>>> = Arc::new(RwLock::new(None));
 
 		// Load saved MCP servers from config
 		let config = McpConfig::load();
@@ -73,41 +73,21 @@ impl App {
 		let loading_started = model_path.as_ref().map(|_| std::time::Instant::now());
 		let loading_progress = model_path.map(|path| {
 			let progress = LoadingProgress::new();
-			let loading_server = Arc::clone(&loading_server);
 			let dirty = Arc::clone(&dirty);
 			progress.set(0, "Starting model load...");
 			let p = progress.clone();
 
+			// Background model loading is disabled: it drove the deleted
+			// `models::server::ModelServer`. Restore this once a sandbag-backed
+			// server exists; the loading modal and progress plumbing are intact.
 			std::thread::spawn(move || {
-				log::info!("Background model loading from {}", path.display());
-				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-					ModelServer::open_with_progress(&path, Some(&p))
-				}));
-				match result {
-					Ok(Ok(server)) => {
-						p.finish();
-						*loading_server.write().unwrap() = Some(Arc::new(server));
-						dirty.store(true, Ordering::SeqCst);
-						log::info!("Background model loading complete");
-					}
-					Ok(Err(e)) => {
-						p.fail(&format!("Error: {}", e));
-						dirty.store(true, Ordering::SeqCst);
-						log::error!("Background model loading failed: {}", e);
-					}
-					Err(panic_info) => {
-						let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-							s.to_string()
-						} else if let Some(s) = panic_info.downcast_ref::<String>() {
-							s.clone()
-						} else {
-							"unknown panic".to_string()
-						};
-						p.fail(&format!("PANIC: {}", msg));
-						dirty.store(true, Ordering::SeqCst);
-						log::error!("Background model loading PANICKED: {}", msg);
-					}
-				}
+				log::warn!(
+					"Background model loading skipped for {} — ModelServer not implemented \
+					 for the sandbag format",
+					path.display()
+				);
+				p.fail("Local model loading not available");
+				dirty.store(true, Ordering::SeqCst);
 			});
 
 			progress
@@ -121,11 +101,11 @@ impl App {
 			show_mcp_modal: false,
 			mcp_modal,
 			pending_mcp_server: Arc::new(RwLock::new(None)),
-			model_server: None,
+			// model_server: None,
 			last_areas: None,
 			loading_progress,
 			loading_started,
-			loading_server,
+			// loading_server,
 		}
 	}
 
@@ -425,12 +405,13 @@ impl App {
 		if let Some(ref lp) = self.loading_progress {
 			if lp.is_done() {
 				// Model fully loaded — transition server and dismiss modal
-				if let Ok(mut slot) = self.loading_server.write() {
-					if let Some(server) = slot.take() {
-						self.model_server = Some(server);
-						log::info!("Model server transitioned to active — all tensors cached");
-					}
-				}
+				// Disabled with `model_server`/`loading_server`; see struct fields.
+				// if let Ok(mut slot) = self.loading_server.write() {
+				// 	if let Some(server) = slot.take() {
+				// 		self.model_server = Some(server);
+				// 		log::info!("Model server transitioned to active — all tensors cached");
+				// 	}
+				// }
 				self.loading_progress = None;
 				self.loading_started = None;
 				self.dirty.store(true, Ordering::SeqCst);
@@ -527,18 +508,18 @@ impl App {
 													}
 												});
 											}
-											// Route to local model if loaded
-											if let Some(ref server) = self.model_server {
-												log::debug!("routing message to local model");
-												chat_ref.add_pending_response();
-												let server = Arc::clone(server);
-												let chat = self.chat.clone();
-												tokio::task::spawn_blocking(move || {
-													let response =
-														server.process_message(&content_for_model);
-													chat.deliver_response(response);
-												});
-											}
+											// Route to local model if loaded — disabled with `model_server`.
+											// if let Some(ref server) = self.model_server {
+											// 	log::debug!("routing message to local model");
+											// 	chat_ref.add_pending_response();
+											// 	let server = Arc::clone(server);
+											// 	let chat = self.chat.clone();
+											// 	tokio::task::spawn_blocking(move || {
+											// 		let response =
+											// 			server.process_message(&content_for_model);
+											// 		chat.deliver_response(response);
+											// 	});
+											// }
 										}
 									}
 								}
@@ -704,17 +685,17 @@ impl App {
 									}
 								});
 							}
-							// Route to local model if loaded
-							if let Some(ref server) = self.model_server {
-								log::debug!("routing message to local model");
-								chat_ref.add_pending_response();
-								let server = Arc::clone(server);
-								let chat = self.chat.clone();
-								tokio::task::spawn_blocking(move || {
-									let response = server.process_message(&content_for_model);
-									chat.deliver_response(response);
-								});
-							}
+							// Route to local model if loaded — disabled with `model_server`.
+							// if let Some(ref server) = self.model_server {
+							// 	log::debug!("routing message to local model");
+							// 	chat_ref.add_pending_response();
+							// 	let server = Arc::clone(server);
+							// 	let chat = self.chat.clone();
+							// 	tokio::task::spawn_blocking(move || {
+							// 		let response = server.process_message(&content_for_model);
+							// 		chat.deliver_response(response);
+							// 	});
+							// }
 						}
 					}
 				}

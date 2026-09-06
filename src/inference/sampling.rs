@@ -23,53 +23,47 @@ pub fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
 	// Find max for numerical stability before exp
 	let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
 
-	// Apply temperature + exp (shifted by max to prevent overflow)
+	// Build (index, prob) tuples — apply temperature + exp (shifted by max)
 	let inv_temp = 1.0f32 / temperature;
-	let probs: Vec<f32> = logits
+	let mut probs: Vec<(usize, f32)> = logits
 		.iter()
-		.map(|&v| ((v - max_logit) * inv_temp).exp())
+		.enumerate()
+		.map(|(i, &v)| (i, ((v - max_logit) * inv_temp).exp()))
 		.collect();
 
-	// Isolate top-k candidates using select_nth_unstable
-	let mut indices: Vec<usize> = (0..n).collect();
+	// Select top-k: partition so the k highest are at the front
 	let k = top_k.min(n);
-	if k > 0 {
-		indices.select_nth_unstable_by(k - 1, |&a, &b| {
-			probs[b]
-				.partial_cmp(&probs[a])
-				.unwrap_or(std::cmp::Ordering::Equal)
+	if k < n {
+		// Put the top-k elements (by prob, descending) into the first k slots
+		probs.select_nth_unstable_by(k, |a, b| {
+			b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
 		});
-		indices.truncate(k);
-
-		// CRITICAL FIX: Sort the sliced subset into descending order to ensure
-		// the CDF selection iteration properly respects descending weight priorities.
-		indices.sort_by(|&a, &b| {
-			probs[b]
-				.partial_cmp(&probs[a])
-				.unwrap_or(std::cmp::Ordering::Equal)
-		});
+		probs.truncate(k);
 	}
 
-	// Softmax over top-k
+	// Sort the top-k descending for stable CDF walk
+	probs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+	// Softmax normalization over top-k
 	let mut sum = 0.0f32;
-	for &i in &indices {
-		sum += probs[i];
+	for (_, p) in &probs {
+		sum += *p;
 	}
 	if sum == 0.0 {
-		return indices[0] as u32;
+		return probs[0].0 as u32;
 	}
 	let inv = 1.0f32 / sum;
 
 	// Sample via CDF scanning
 	let r: f32 = rand_val();
 	let mut cdf = 0.0f32;
-	for &i in &indices {
-		cdf += probs[i] * inv;
+	for &(i, p) in &probs {
+		cdf += p * inv;
 		if r < cdf {
 			return i as u32;
 		}
 	}
-	*indices.last().unwrap() as u32
+	probs.last().map(|(i, _)| *i as u32).unwrap_or(0)
 }
 
 /// Simple PRNG (xorshift) initialized dynamically with system clocks to guarantee non-determinism.

@@ -1,216 +1,150 @@
-// benches/decompress_bench.rs
-//
-// Decompression benchmarks with error measurement.
-// Compression is done once upfront; only decompression is timed.
+//! Sandbag read-path benchmarks.
+//!
+//! Not a decompression pipeline — there isn't one. A weight is reconstructed in
+//! place from its own prefix, tail, sign bit and block scale, which is what the
+//! GEMV kernel does inline. This measures that reconstruction, plus the index
+//! parse and the offset derivation that locate a tensor without a stored table.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::sync::{Arc, Mutex};
+use agent_harness::models::format::*;
+use agent_harness::models::quantize::*;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use agent_harness::models::dedupe::tensor::DedupCountTensor;
-use agent_harness::models::dedupe::compressor::init_global_controller;
+const N: usize = 1 << 20;
 
-/// Deterministic pseudo-random weights (LCG → Box-Muller → N(0, σ²)).
-/// σ=0.3 approximates typical transformer weight magnitudes.
-fn make_weights(n: usize) -> Vec<f32> {
-	let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
-	let mut out = Vec::with_capacity(n);
-	let sigma = 0.3_f64;
-	loop {
-		state = state
-			.wrapping_mul(6364136223846793005)
-			.wrapping_add(1442695040888963407);
-		let u1 = (((state >> 40) as f64) / (1u64 << 24) as f64)
-			.max(1e-15)
-			.min(1.0 - f64::EPSILON);
-		state = state
-			.wrapping_mul(6364136223846793005)
-			.wrapping_add(1442695040888963407);
-		let u2 = ((state >> 40) as f64) / (1u64 << 24) as f64;
-		let r = (-2.0_f64 * u1.ln()).sqrt();
-		let theta = u2 * 2.0 * std::f64::consts::PI;
-		out.push((r * theta.cos() * sigma) as f32);
-		if out.len() >= n {
-			break;
-		}
-		out.push((r * theta.sin() * sigma) as f32);
-		if out.len() >= n {
-			break;
+fn synthetic_weights(n: usize) -> Vec<f32> {
+	let mut s = 0x9E37_79B9_7F4A_7C15u64;
+	let mut next = || {
+		s ^= s << 13;
+		s ^= s >> 7;
+		s ^= s << 17;
+		s
+	};
+	(0..n)
+		.map(|_| {
+			let u1 = (next() >> 11) as f32 / (1u64 << 53) as f32;
+			let u2 = (next() >> 11) as f32 / (1u64 << 53) as f32;
+			(-2.0 * (u1.max(1e-9)).ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.02
+		})
+		.collect()
+}
+
+/// Encoded payload plus the plane offsets a reader derives from elem_count.
+struct Encoded {
+	bytes: Vec<u8>,
+	pairs_at: usize,
+	signs_at: usize,
+}
+
+fn encoded(n: usize, digits: u32) -> Encoded {
+	let vals = synthetic_weights(n);
+	let threshold = calibrate(&vals, ScaleMethod::MaxAbs);
+	Encoded {
+		bytes: encode_sandbag(&vals, digits, threshold),
+		pairs_at: sandbag_pairs_offset(n as u64) as usize,
+		signs_at: sandbag_sign_offset(n as u64) as usize,
+	}
+}
+
+/// Reconstruct every weight in a tensor.
+fn decode_all(e: &Encoded, n: usize, digits: u32, out: &mut [f32]) {
+	let block = SANDBAG_BLOCK_ELEMS as usize;
+	for b in 0..n.div_ceil(block) {
+		let scale = half::f16::from_le_bytes([e.bytes[b * 2], e.bytes[b * 2 + 1]]).to_f32();
+		let lo = b * block;
+		let hi = (lo + block).min(n);
+		for i in lo..hi {
+			let prefix = e.bytes[e.pairs_at + i * 2];
+			let tail = e.bytes[e.pairs_at + i * 2 + 1];
+			let word = u64::from_le_bytes(
+				e.bytes[e.signs_at + (i / 64) * 8..e.signs_at + (i / 64) * 8 + 8]
+					.try_into()
+					.unwrap(),
+			);
+			let negative = (word >> (i % 64)) & 1 == 1;
+			out[i] = decode_sandbag_weight(prefix, tail, negative, scale, digits);
 		}
 	}
-	out.truncate(n);
+}
+
+fn bench_decode_weights(c: &mut Criterion) {
+	let mut g = c.benchmark_group("sandbag/decode");
+	g.throughput(Throughput::Elements(N as u64));
+	let mut out = vec![0.0f32; N];
+	for digits in [1u32, 2, 3] {
+		let e = encoded(N, digits);
+		g.bench_with_input(BenchmarkId::from_parameter(digits), &digits, |b, &d| {
+			b.iter(|| decode_all(black_box(&e), N, d, &mut out));
+		});
+	}
+	g.finish();
+}
+
+/// Just the sign plane — one bit per weight, read as u64 words.
+fn bench_sign_plane(c: &mut Criterion) {
+	let e = encoded(N, DEFAULT_TAIL_DIGITS);
+	let mut g = c.benchmark_group("sandbag/sign_plane");
+	g.throughput(Throughput::Elements(N as u64));
+	g.bench_function("popcount", |b| {
+		b.iter(|| {
+			let mut negatives = 0u32;
+			let words = N.div_ceil(64);
+			for w in 0..words {
+				let word = u64::from_le_bytes(
+					e.bytes[e.signs_at + w * 8..e.signs_at + w * 8 + 8]
+						.try_into()
+						.unwrap(),
+				);
+				negatives += black_box(word).count_ones();
+			}
+			negatives
+		});
+	});
+	g.finish();
+}
+
+/// Index parse and offset derivation — the work that replaces a stored offset
+/// table. Cost scales with tensor count, not with model size.
+fn bench_index_parse(c: &mut Criterion) {
+	let mut g = c.benchmark_group("sandbag/index");
+	for count in [64usize, 320, 1024] {
+		let file = synthetic_sandbag_file(count);
+		g.throughput(Throughput::Elements(count as u64));
+		g.bench_with_input(BenchmarkId::from_parameter(count), &file, |b, f| {
+			b.iter(|| SandbagReader::from_bytes(black_box(f)).unwrap());
+		});
+	}
+	g.finish();
+}
+
+/// A header + index with `count` small tensors, and a payload sized to match.
+fn synthetic_sandbag_file(count: usize) -> Vec<u8> {
+	let elems: u64 = 256;
+	let per = sandbag_tensor_bytes(elems);
+	let header = SandbagHeader::new(count as u64, per * count as u64);
+
+	let mut out = Vec::new();
+	out.extend_from_slice(&header.magic.to_le_bytes());
+	out.extend_from_slice(&header.version.to_le_bytes());
+	out.extend_from_slice(&header.num_tensors.to_le_bytes());
+	out.extend_from_slice(&header.total_data_bytes.to_le_bytes());
+
+	for i in 0..count {
+		let name = format!("blk.{i}.attn_q.weight");
+		out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+		out.extend_from_slice(name.as_bytes());
+		out.extend_from_slice(&2u64.to_le_bytes());
+		out.extend_from_slice(&16u64.to_le_bytes());
+		out.extend_from_slice(&16u64.to_le_bytes());
+		out.push(GgmlType::Sandbag as u8);
+	}
+	out.resize(out.len() + (per * count as u64) as usize, 0);
 	out
 }
 
-/// Initialize Vulkan + global MemoryController for GPU benchmarks.
-fn init_gpu() -> Result<(), String> {
-	use ash::vk;
-	use gpu_allocator::vulkan::AllocatorCreateDesc;
-	use gpu_allocator::AllocationSizes;
-
-	let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
-	let app_name = c"decompress_bench";
-	let app_info = vk::ApplicationInfo::default()
-		.application_name(&app_name)
-		.api_version(vk::API_VERSION_1_2);
-	let instance_create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
-	let instance = unsafe { entry.create_instance(&instance_create_info, None) }
-		.map_err(|e| format!("create_instance failed: {:?}", e))?;
-
-	let phys_devices = unsafe { instance.enumerate_physical_devices() }
-		.map_err(|e| format!("enumerate_physical_devices failed: {:?}", e))?;
-	if phys_devices.is_empty() {
-		return Err("No Vulkan physical devices found".into());
-	}
-	let physical_device = phys_devices[0];
-
-	let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-	let queue_family_index = queue_families
-		.iter()
-		.position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE))
-		.ok_or("No compute queue family found")? as u32;
-
-	let queue_family = vk::DeviceQueueCreateInfo::default()
-		.queue_family_index(queue_family_index)
-		.queue_priorities(&[1.0]);
-
-	let enabled_features = vk::PhysicalDeviceFeatures::default();
-	let queue_family_list = [queue_family];
-	let device_create_info = vk::DeviceCreateInfo::default()
-		.queue_create_infos(&queue_family_list)
-		.enabled_features(&enabled_features);
-
-	let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }
-		.map_err(|e| format!("create device failed: {:?}", e))?;
-
-	let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-
-	let allocator = gpu_allocator::vulkan::Allocator::new(&AllocatorCreateDesc {
-		instance,
-		device: device.clone(),
-		physical_device,
-		debug_settings: Default::default(),
-		buffer_device_address: false,
-		allocation_sizes: AllocationSizes::default(),
-	})
-	.map_err(|e| format!("allocator create failed: {:?}", e))?;
-
-	// Dummy instance for controller init (needs &Instance for memory property query)
-	let entry2 = unsafe { ash::Entry::load() }.map_err(|e| format!("Vulkan entry load failed: {:?}", e))?;
-	let dummy_app = c"init_helper";
-	let dummy_app_info = vk::ApplicationInfo::default()
-		.application_name(&dummy_app)
-		.api_version(vk::API_VERSION_1_2);
-	let dummy_instance = unsafe { entry2.create_instance(&vk::InstanceCreateInfo::default().application_info(&dummy_app_info), None) }
-		.map_err(|e| format!("dummy instance failed: {:?}", e))?;
-
-	unsafe {
-		init_global_controller(
-			&dummy_instance,
-			physical_device,
-			device,
-			queue,
-			Arc::new(Mutex::new(allocator)),
-		)
-	}
-}
-
-/// Mean squared error between two vectors (same length).
-fn mse(a: &[f32], b: &[f32]) -> f32 {
-	let len = a.len().min(b.len());
-	if len == 0 {
-		return 0.0;
-	}
-	let sum: f32 = a
-		.iter()
-		.zip(b.iter())
-		.map(|(&x, &y)| {
-			let d = x - y;
-			d * d
-		})
-		.sum();
-	sum / len as f32
-}
-
-fn bench_decompress(c: &mut Criterion) {
-	let n = 1_000_000;
-	let prefix_digits = 2;
-	let truncate_rounds = 3;
-	let weights = make_weights(n);
-
-	// ── Initialize GPU ──
-	let gpu_init = init_gpu();
-	if let Err(ref e) = gpu_init {
-		eprintln!("decompress_bench: GPU init failed: {} — GPU benches will be skipped", e);
-	}
-
-	// Pre-compress all methods once
-	let (tensor_sp, sandbag_sp) =
-		DedupCountTensor::compress_quantized(&weights, prefix_digits, truncate_rounds);
-	let (tensor_sk, sandbag_sk) =
-		DedupCountTensor::compress_quantized_kl(&weights, prefix_digits, truncate_rounds);
-	let (tensor_ap, sandbag_ap) =
-		DedupCountTensor::compress_avx512_percent(&weights, prefix_digits, truncate_rounds);
-	let (tensor_ak, sandbag_ak) =
-		DedupCountTensor::compress_avx512_kl(&weights, prefix_digits, truncate_rounds);
-
-	// Print error for all
-	for (name, tensor, sandbag) in [
-		("scalar_percent", &tensor_sp, &sandbag_sp),
-		("scalar_kl", &tensor_sk, &sandbag_sk),
-		("avx512_percent", &tensor_ap, &sandbag_ap),
-		("avx512_kl", &tensor_ak, &sandbag_ak),
-	] {
-		let recon = tensor.decompress_all(sandbag);
-		let err = mse(&weights, &recon);
-		eprintln!("  {name:24} roundtrip_mse = {:.2e}", err);
-	}
-
-	// GPU quantize — bucket output (reconstruction from buckets TODO)
-	if gpu_init.is_ok() {
-		let gpu_out = DedupCountTensor::gpu_quantize(&weights, prefix_digits);
-		if let Some(ref out) = gpu_out {
-			let tails = out.last_tail_per_block();
-			eprintln!("gpu_quantize last_tail_per_block: {:?}", tails);
-		} else {
-			eprintln!("gpu_quantize returned None despite GPU init");
-		}
-	}
-
-	// Benchmark decompression only
-	let mut group = c.benchmark_group("decompress");
-	group.throughput(Throughput::Elements(n as u64));
-	group.sample_size(256);
-
-	group.bench_function("scalar_percent", |b| {
-		b.iter(|| {
-			let recon = tensor_sp.decompress_all(&sandbag_sp);
-			criterion::black_box(recon);
-		});
-	});
-
-	group.bench_function("scalar_kl", |b| {
-		b.iter(|| {
-			let recon = tensor_sk.decompress_all(&sandbag_sk);
-			criterion::black_box(recon);
-		});
-	});
-
-	group.bench_function("avx512_percent", |b| {
-		b.iter(|| {
-			let recon = tensor_ap.decompress_all(&sandbag_ap);
-			criterion::black_box(recon);
-		});
-	});
-
-	group.bench_function("avx512_kl", |b| {
-		b.iter(|| {
-			let recon = tensor_ak.decompress_all(&sandbag_ak);
-			criterion::black_box(recon);
-		});
-	});
-
-	group.finish();
-}
-
-criterion_group!(decompress_benches, bench_decompress);
-criterion_main!(decompress_benches);
+criterion_group!(
+	benches,
+	bench_decode_weights,
+	bench_sign_plane,
+	bench_index_parse
+);
+criterion_main!(benches);

@@ -1,119 +1,96 @@
-// benches/f16_convert_bench.rs
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+//! bf16/f16 -> f32 widening: scalar vs the AVX-512 kernels.
+//!
+//! This is the first stage of every conversion, so it sets the ceiling on
+//! `quantize_cpu` throughput. `models::quantize::decode_to_f32` currently takes
+//! the scalar path even though `kernels::avx512` has vectorized versions —
+//! this bench is what that decision should be judged on.
 
-use agent_harness::models::avx512_kernel::{
-	avx512_bf16_to_f32, avx512_f16_to_f32, bf16_to_f32_scalar, dispatch_bf16_bytes_to_f32,
-	dispatch_f16_bytes_to_f32, f16_to_f32_scalar,
-};
+use agent_harness::kernels::avx512::{avx512_bf16_to_f32, avx512_f16_to_f32};
+use agent_harness::models::format::GgmlType;
+use agent_harness::models::quantize::decode_to_f32;
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-/// Deterministic pseudo-random byte buffer (LCG, no rand crate needed).
-fn make_bytes(n_bytes: usize) -> Vec<u8> {
-	let mut buf = Vec::with_capacity(n_bytes);
-	let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
-	for _ in 0..(n_bytes / 2) {
-		state = state
-			.wrapping_mul(6364136223846793005)
-			.wrapping_add(1442695040888963407);
-		let bits = (state >> 32) as u16;
-		buf.push(bits as u8);
-		buf.push((bits >> 8) as u8);
-	}
-	buf
+const N: usize = 1 << 20;
+
+fn sample_f32(n: usize) -> Vec<f32> {
+	let mut s = 0x1234_5678_9ABC_DEF0u64;
+	(0..n)
+		.map(|_| {
+			s ^= s << 13;
+			s ^= s >> 7;
+			s ^= s << 17;
+			// Spread across a realistic weight range rather than [0,1).
+			((s >> 40) as f32 / 16_777_216.0 - 0.5) * 0.08
+		})
+		.collect()
 }
 
-/// Pure scalar F16 -> f32 (element-by-element, no SIMD).
-fn f16_scalar_loop(src: &[u8]) -> Vec<f32> {
-	let n = src.len() / 2;
-	let mut out = Vec::with_capacity(n);
-	for i in 0..n {
-		let bits = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-		out.push(f16_to_f32_scalar(bits));
-	}
-	out
+fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
+	vals.iter()
+		.flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+		.collect()
 }
 
-/// Pure scalar BF16 -> f32 (element-by-element, no SIMD).
-fn bf16_scalar_loop(src: &[u8]) -> Vec<f32> {
-	let n = src.len() / 2;
-	let mut out = Vec::with_capacity(n);
-	for i in 0..n {
-		let bits = u16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-		out.push(bf16_to_f32_scalar(bits));
-	}
-	out
+fn f16_bytes(vals: &[f32]) -> Vec<u8> {
+	vals.iter()
+		.flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+		.collect()
 }
 
-fn bench_f16(c: &mut Criterion) {
-	let n_elems = 4_096_000; // ~8 MB
-	let src = make_bytes(n_elems * 2);
-
-	let mut group = c.benchmark_group("f16_to_f32");
-	group.throughput(Throughput::Elements(n_elems as u64));
-
-	group.bench_function("scalar_loop", |b| {
-		b.iter(|| {
-			let out = f16_scalar_loop(&src);
-			criterion::black_box(&out);
-		});
-	});
-
-	if is_x86_feature_detected!("avx512f") {
-		group.bench_function("avx512_dispatch", |b| {
-			b.iter(|| {
-				let out = dispatch_f16_bytes_to_f32(&src);
-				criterion::black_box(&out);
-			});
-		});
-
-		group.bench_function("avx512_kernel_only", |b| {
-			b.iter(|| {
-				let mut out = vec![0f32; n_elems];
-				unsafe {
-					avx512_f16_to_f32(&src, &mut out);
-				}
-				criterion::black_box(&out);
-			});
-		});
+fn has_avx512() -> bool {
+	#[cfg(target_arch = "x86_64")]
+	{
+		is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
 	}
-
-	group.finish();
+	#[cfg(not(target_arch = "x86_64"))]
+	{
+		false
+	}
 }
 
 fn bench_bf16(c: &mut Criterion) {
-	let n_elems = 4_096_000;
-	let src = make_bytes(n_elems * 2);
+	let vals = sample_f32(N);
+	let src = bf16_bytes(&vals);
+	let mut out = vec![0.0f32; N];
 
-	let mut group = c.benchmark_group("bf16_to_f32");
-	group.throughput(Throughput::Elements(n_elems as u64));
+	let mut g = c.benchmark_group("bf16_to_f32");
+	g.throughput(Throughput::Elements(N as u64));
 
-	group.bench_function("scalar_loop", |b| {
-		b.iter(|| {
-			let out = bf16_scalar_loop(&src);
-			criterion::black_box(&out);
-		});
+	g.bench_function("scalar_decode_to_f32", |b| {
+		b.iter(|| decode_to_f32(black_box(&src), N, GgmlType::BF16).unwrap());
 	});
 
-	if is_x86_feature_detected!("avx512f") {
-		group.bench_function("avx512_dispatch", |b| {
-			b.iter(|| {
-				let out = dispatch_bf16_bytes_to_f32(&src);
-				criterion::black_box(&out);
-			});
+	if has_avx512() {
+		g.bench_function("avx512", |b| {
+			b.iter(|| unsafe { avx512_bf16_to_f32(black_box(&src), &mut out) });
 		});
-
-		group.bench_function("avx512_kernel_only", |b| {
-			b.iter(|| {
-				let mut out = vec![0f32; n_elems];
-				unsafe {
-					avx512_bf16_to_f32(&src, &mut out);
-				}
-				criterion::black_box(&out);
-			});
-		});
+	} else {
+		eprintln!("avx512f/avx512bw not present; skipping vectorized bf16 bench");
 	}
-
-	group.finish();
+	g.finish();
 }
 
-criterion_group!(benches, bench_f16, bench_bf16);
+fn bench_f16(c: &mut Criterion) {
+	let vals = sample_f32(N);
+	let src = f16_bytes(&vals);
+	let mut out = vec![0.0f32; N];
+
+	let mut g = c.benchmark_group("f16_to_f32");
+	g.throughput(Throughput::Elements(N as u64));
+
+	g.bench_function("scalar_decode_to_f32", |b| {
+		b.iter(|| decode_to_f32(black_box(&src), N, GgmlType::F16).unwrap());
+	});
+
+	if has_avx512() {
+		g.bench_function("avx512", |b| {
+			b.iter(|| unsafe { avx512_f16_to_f32(black_box(&src), &mut out) });
+		});
+	} else {
+		eprintln!("avx512f/avx512bw not present; skipping vectorized f16 bench");
+	}
+	g.finish();
+}
+
+criterion_group!(benches, bench_bf16, bench_f16);
 criterion_main!(benches);

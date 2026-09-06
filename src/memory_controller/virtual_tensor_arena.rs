@@ -1,8 +1,10 @@
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
+use gpu_allocator::vulkan::Allocator;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PageResidency {
 	Unmapped,
 	GpuResident,
@@ -14,6 +16,7 @@ pub enum OperationType {
 	Drop,
 }
 
+#[derive(Debug)]
 pub struct VirtualPage {
 	pub residency: PageResidency,
 	pub gpu_allocation: Option<Allocation>,
@@ -24,12 +27,31 @@ impl Clone for VirtualPage {
 	fn clone(&self) -> Self {
 		Self {
 			residency: self.residency,
-			gpu_allocation: None, // Allocation isn't Clone; workers don't need it for page writes
+			gpu_allocation: None,
 			cpu_offset: self.cpu_offset,
 		}
 	}
 }
 
+// --- Serde Blueprint Structs ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VirtualPageBlueprint {
+	pub residency: PageResidency,
+	pub cpu_offset: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VirtualTensorArenaBlueprint {
+	pub total_virtual_size: vk::DeviceSize,
+	pub page_size: vk::DeviceSize,
+	pub total_pages: usize,
+	pub page_table: Vec<VirtualPageBlueprint>,
+}
+
+// --- Live Application Type ---
+
+#[derive(Clone, Debug)]
 pub struct VirtualTensorArena {
 	pub total_virtual_size: vk::DeviceSize,
 	pub page_size: vk::DeviceSize,
@@ -80,6 +102,68 @@ impl VirtualTensorArena {
 		}
 	}
 
+	// --- Serialization Exporters ---
+
+	/// Export live layout state into a clean serializable struct
+	pub fn to_blueprint(&self) -> VirtualTensorArenaBlueprint {
+		let page_table = self
+			.page_table
+			.iter()
+			.map(|p| VirtualPageBlueprint {
+				residency: p.residency,
+				cpu_offset: p.cpu_offset,
+			})
+			.collect();
+
+		VirtualTensorArenaBlueprint {
+			total_virtual_size: self.total_virtual_size,
+			page_size: self.page_size,
+			total_pages: self.total_pages,
+			page_table,
+		}
+	}
+
+	/// Reconstruct a live arena and its underlying sparse buffer from a deserialized blueprint
+	pub unsafe fn from_blueprint(
+		blueprint: VirtualTensorArenaBlueprint,
+		device: &ash::Device,
+		allocator: Arc<Mutex<Allocator>>,
+	) -> Self {
+		let buffer_create_info = vk::BufferCreateInfo::default()
+			.size(blueprint.total_virtual_size)
+			.usage(
+				vk::BufferUsageFlags::STORAGE_BUFFER
+					| vk::BufferUsageFlags::TRANSFER_DST
+					| vk::BufferUsageFlags::TRANSFER_SRC,
+			)
+			.sharing_mode(vk::SharingMode::EXCLUSIVE)
+			.flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY);
+
+		let buffer = unsafe { device.create_buffer(&buffer_create_info, None) };
+		let sparse_buffer = buffer.expect("Failed to recreate sparse buffer from blueprint.");
+
+		let page_table = blueprint
+			.page_table
+			.into_iter()
+			.map(|p| VirtualPage {
+				residency: p.residency,
+				gpu_allocation: None, // Starts fresh; streaming loop can repopulate required pages
+				cpu_offset: p.cpu_offset,
+			})
+			.collect();
+
+		Self {
+			total_virtual_size: blueprint.total_virtual_size,
+			page_size: blueprint.page_size,
+			total_pages: blueprint.total_pages,
+			sparse_buffer,
+			page_table,
+			allocator,
+		}
+	}
+
+	// --- Memory Operations ---
+
 	pub unsafe fn commit_page(
 		&mut self,
 		device: &ash::Device,
@@ -98,7 +182,6 @@ impl VirtualTensorArena {
 			unsafe { device.get_buffer_memory_requirements(self.sparse_buffer) };
 		let mut allocator_guard = allocator_clone.lock().unwrap();
 
-		// 1. Build the allocation footprint descriptor variable explicitly
 		let alloc_desc = AllocationCreateDesc {
 			name: "tensor_page_gpu",
 			requirements: vk::MemoryRequirements {
@@ -111,9 +194,7 @@ impl VirtualTensorArena {
 			allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
 		};
 
-		// 2. Pass a BORROWED REFERENCE (&alloc_desc) to the true allocate function
 		let gpu_alloc_result = allocator_guard.allocate(&alloc_desc);
-
 		drop(allocator_guard);
 
 		match gpu_alloc_result {
@@ -134,43 +215,31 @@ impl VirtualTensorArena {
 				let bind_info = vk::BindSparseInfo::default()
 					.buffer_binds(std::slice::from_ref(&buffer_bind_info));
 
-								let fence = unsafe {
-					device.create_fence(&vk::FenceCreateInfo::default(), None)
+				let fence = unsafe {
+					device
+						.create_fence(&vk::FenceCreateInfo::default(), None)
 						.expect("create fence for sparse bind")
 				};
 
 				let bind_result =
 					unsafe { device.queue_bind_sparse(bind_queue, &[bind_info], fence) };
-				bind_result.expect("Queue bind sparse submission failed");
-
-				// --- VALID VULKAN QUEUE PUMP ---
-				// Submitting an empty SubmitInfo array to the queue family forces the 
-				// asynchronous sparse timeline to immediately flush and execute.
-				unsafe {
-					device.queue_submit(bind_queue, &[], vk::Fence::null())
-						.expect("Queue flush submission failed");
-				}
-				// -------------------------------
-
-				// Your Exact Debugging Instrumentation Layout
-				let t_bind = std::time::Instant::now();
-				eprintln!("[VTA] page={} waiting on sparse bind fence...", page_index);
-				unsafe {
-					device
-						.wait_for_fences(&[fence], true, u64::MAX)
-						.expect("wait sparse bind fence");
-					device.destroy_fence(fence, None);
-				}
-				eprintln!(
-					"[VTA] page={} sparse bind fence signaled after {:?}",
-					page_index,
-					t_bind.elapsed()
-				);
-
-
 
 				match bind_result {
 					Ok(_) => {
+						let t_bind = std::time::Instant::now();
+						eprintln!("[VTA] page={} waiting on sparse bind fence...", page_index);
+						unsafe {
+							device
+								.wait_for_fences(&[fence], true, u64::MAX)
+								.expect("wait sparse bind fence");
+							device.destroy_fence(fence, None);
+						}
+						eprintln!(
+							"[VTA] page={} sparse bind fence signaled after {:?}",
+							page_index,
+							t_bind.elapsed()
+						);
+
 						page.residency = PageResidency::GpuResident;
 						page.gpu_allocation = Some(allocation);
 						println!(
@@ -179,6 +248,9 @@ impl VirtualTensorArena {
 						);
 					}
 					Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {
+						unsafe {
+							device.destroy_fence(fence, None);
+						}
 						let mut allocator_guard = allocator_clone.lock().unwrap();
 						let _ = allocator_guard.free(allocation);
 						self.route_page_to_cpu(page_index);
@@ -208,37 +280,41 @@ impl VirtualTensorArena {
 		allocator: Arc<Mutex<Allocator>>,
 		bind_queue: vk::Queue,
 		device: &ash::Device,
-		op_type: OperationType,
+		_op_type: OperationType,
 	) {
 		let offset = page_index as vk::DeviceSize * self.page_size;
 		let page = &mut self.page_table[page_index];
+
 		if page.residency != PageResidency::GpuResident {
 			return;
 		}
+
 		if let Some(allocation) = page.gpu_allocation.take() {
-			let raw_memory = unsafe { allocation.memory() };
+			// Memory target field must point to a null handle to strip sparse residency bindings
 			let memory_bind = vk::SparseMemoryBind::default()
 				.resource_offset(offset)
 				.size(self.page_size)
-				.memory(raw_memory)
-				.memory_offset(allocation.offset());
+				.memory(vk::DeviceMemory::null())
+				.memory_offset(0);
+
 			let buffer_bind_info = vk::SparseBufferMemoryBindInfo::default()
 				.buffer(self.sparse_buffer)
 				.binds(std::slice::from_ref(&memory_bind));
+
 			let bind_info =
 				vk::BindSparseInfo::default().buffer_binds(std::slice::from_ref(&buffer_bind_info));
 
-			// Create a real fence to force synchronization
 			let fence = unsafe {
 				device
 					.create_fence(&vk::FenceCreateInfo::default(), None)
 					.expect("create fence for sparse unbind")
 			};
 
-			let _ = unsafe { device.queue_bind_sparse(bind_queue, &[bind_info], fence) };
-
-			// Block the CPU thread until the unbind is fully completed by the GPU
 			unsafe {
+				device
+					.queue_bind_sparse(bind_queue, &[bind_info], fence)
+					.expect("Queue sparse unbind submission failed");
+
 				device
 					.wait_for_fences(&[fence], true, u64::MAX)
 					.expect("wait sparse unbind fence");
@@ -248,19 +324,9 @@ impl VirtualTensorArena {
 			let mut allocator_guard = allocator.lock().unwrap();
 			let _ = allocator_guard.free(allocation);
 		}
+
 		page.residency = PageResidency::Unmapped;
 		page.gpu_allocation = None;
 		println!("Page {} safely evicted from GPU.", page_index);
-	}
-
-	pub fn clone_shallow(&self) -> Self {
-		Self {
-			total_virtual_size: self.total_virtual_size,
-			page_size: self.page_size,
-			total_pages: self.total_pages,
-			sparse_buffer: self.sparse_buffer,
-			page_table: self.page_table.clone(),
-			allocator: Arc::clone(&self.allocator),
-		}
 	}
 }

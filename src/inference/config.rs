@@ -1,6 +1,6 @@
 // Model configuration — supports both Qwen3.5 (GGUF) and Qwen2 (HuggingFace) formats.
 
-use crate::models::formats::gguf::{GGUFFile, GGUFValue};
+use crate::models::format::{GgufHeader, GgufValue};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,13 +58,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-	pub fn from_gguf(gguf: &GGUFFile) -> Self {
+	pub fn from_gguf(gguf: &GgufHeader) -> Self {
 		let get_u32 = |key: &str| -> u32 {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::U32(v) => Some(*v),
-					GGUFValue::U64(v) => Some(*v as u32),
+					GgufValue::Uint32(v) => Some(*v),
+					GgufValue::Uint64(v) => Some(*v as u32),
 					_ => None,
 				})
 				.unwrap_or(0)
@@ -73,8 +73,8 @@ impl ModelConfig {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::U64(v) => Some(*v),
-					GGUFValue::U32(v) => Some(*v as u64),
+					GgufValue::Uint64(v) => Some(*v),
+					GgufValue::Uint32(v) => Some(*v as u64),
 					_ => None,
 				})
 				.unwrap_or(0)
@@ -83,7 +83,7 @@ impl ModelConfig {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GGUFValue::F32(v) => Some(*v),
+					GgufValue::Float32(v) => Some(*v),
 					_ => None,
 				})
 				.unwrap_or(0.0)
@@ -94,7 +94,7 @@ impl ModelConfig {
 			.kv_meta
 			.get("general.architecture")
 			.and_then(|v| match v {
-				GGUFValue::String(s) => Some(s.clone()),
+				GgufValue::String(s) => Some(s.clone()),
 				_ => None,
 			})
 			.unwrap_or_else(|| "qwen35".to_string());
@@ -124,20 +124,19 @@ impl ModelConfig {
 			.tensor_info
 			.iter()
 			.find(|t| t.name == "token_embd.weight")
-			.map(|t| t.dim[1] as usize)
+			.map(|t| t.shape[1] as usize)
 			.unwrap_or(0);
 
 		let rope_sections: [i32; 4] = gguf
 			.kv_meta
 			.get(&format!("{}rope.dimension_sections", prefix))
 			.and_then(|v| match v {
-				GGUFValue::Array(arr) => {
+				GgufValue::Array(arr) => {
 					let vals: Vec<i32> = arr
-						.data
 						.iter()
 						.filter_map(|x| match x {
-							GGUFValue::U64(v) => Some(*v as i32),
-							GGUFValue::U32(v) => Some(*v as i32),
+							GgufValue::Uint64(v) => Some(*v as i32),
+							GgufValue::Uint32(v) => Some(*v as i32),
 							_ => None,
 						})
 						.collect();

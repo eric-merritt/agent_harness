@@ -168,7 +168,14 @@ impl<'a> SsmBlock<'a> {
 
 	/// Forward pass for a single token (autoregressive).
 	/// Uses pre-allocated scratch buffers in `state` — zero intermediate allocation.
-	pub fn forward(&self, input: &[f32], state: &mut SsmState, config: &ModelConfig) -> Vec<f32> {
+	/// Writes result into `output` (must be length `n_embd`).
+	pub fn forward(
+		&self,
+		input: &[f32],
+		state: &mut SsmState,
+		config: &ModelConfig,
+		output: &mut [f32],
+	) {
 		let n_embd = config.n_embd;
 		let head_k_dim = config.ssm_d_state;
 		let num_k_heads = config.ssm_n_group;
@@ -303,14 +310,7 @@ impl<'a> SsmBlock<'a> {
 			}
 		}
 
-		// Step 10: Output projection
-		math::gemv_into(
-			&mut state.out,
-			self.ssm_out,
-			&state.result,
-			n_embd,
-			value_dim,
-		);
-		state.out.clone()
+		// Step 10: Output projection — write directly into caller's buffer
+		math::gemv_into(output, self.ssm_out, &state.result, n_embd, value_dim);
 	}
 }

@@ -1,4 +1,4 @@
-// Standalone conversion tool: GGUF or Safetensors → DedupCountTensor
+// Standalone conversion tool: GGUF or Safetensors → CompressedTensor
 //
 // Usage:
 //   cargo run --bin convert -- --gguf /path/to/model.gguf --out output/dir
@@ -74,20 +74,16 @@ fn main() {
 	let out_path = Path::new(&out_dir);
 
 	if let Some(gguf) = extract_meta {
-		println!("Extracting metadata from GGUF: {}", gguf);
-		let gguf_file = agent_harness::models::formats::gguf::GGUFFile::from_file(Path::new(&gguf))
-			.expect("Failed to parse GGUF");
-		let config = agent_harness::inference::config::ModelConfig::from_gguf(&gguf_file);
-		config
-			.to_file(out_path)
-			.expect("Failed to write config.json");
-		agent_harness::inference::tokenizer::Tokenizer::extract_to_file(&gguf_file, out_path)
-			.expect("Failed to write tokenizer.json");
-		println!(
-			"Written config.json and tokenizer.json to {}",
-			out_path.display()
+		// The GGUF key-value reader lives behind `models::convert::parse_gguf_header`,
+		// which is still a stub (it returns an empty metadata map). Emitting a
+		// config.json from it would silently write an all-zero model config, so
+		// refuse rather than produce a plausible-looking wrong file.
+		eprintln!(
+			"--extract-meta is unavailable: the GGUF metadata parser is not implemented \
+			 (models::convert::parse_gguf_header returns no key-value pairs)."
 		);
-		return;
+		eprintln!("  requested: {}", gguf);
+		std::process::exit(1);
 	}
 
 	if let Some(gguf) = gguf_path {
@@ -96,15 +92,10 @@ fn main() {
 			"  prefix_digits={}, truncate_rounds={}, workers={}",
 			prefix_digits, truncate_rounds, workers
 		);
-		let stats = agent_harness::models::convert::gguf::convert_gguf(
-			Path::new(&gguf),
-			out_path,
-			prefix_digits,
-			truncate_rounds,
-			workers,
-		)
-		.expect("GGUF conversion failed");
-		print_summary(&stats);
+		let dst = out_path.join("model.sandbag");
+		agent_harness::models::convert::convert_gguf_to_sandbag(Path::new(&gguf), &dst)
+			.expect("GGUF conversion failed");
+		print_summary(&dst);
 	} else if let Some(st_dir) = safetensors_dir {
 		let dir = Path::new(&st_dir);
 		let mut shards: Vec<PathBuf> = fs::read_dir(dir)
@@ -118,16 +109,17 @@ fn main() {
 			std::process::exit(1);
 		}
 		shards.sort();
-		println!("Found {} shards, {} workers", shards.len(), workers);
-		let stats = agent_harness::models::convert::safetensors::convert_safetensors_parallel(
-			&shards,
-			out_path,
-			prefix_digits,
-			truncate_rounds,
-			workers,
-		)
-		.expect("safetensors conversion failed");
-		print_summary(&stats);
+		println!("Found {} shards", shards.len());
+		// One sandbag file per shard, named after the shard. Shard order is
+		// preserved so tensors keep their original positions.
+		for shard in &shards {
+			let stem = shard.file_stem().unwrap_or_default().to_string_lossy();
+			let dst = out_path.join(format!("{}.sandbag", stem));
+			eprintln!("Converting {} → {}", shard.display(), dst.display());
+			agent_harness::models::convert::convert_safetensors_to_sandbag(shard, &dst)
+				.expect("safetensors conversion failed");
+			print_summary(&dst);
+		}
 	} else {
 		eprintln!("Must specify --gguf or --safetensors-dir");
 		print_usage();
@@ -151,25 +143,20 @@ fn print_usage() {
 	eprintln!("  --help, -h                 Show this help");
 }
 
-fn print_summary(stats: &agent_harness::models::convert::common::ConversionStats) {
-	let orig_mb = stats.total_original_bytes as f64 / 1_048_576.0;
-	let core_mb = stats.total_core_bytes as f64 / 1_048_576.0;
-	let sand_mb = stats.total_sandbag_bytes as f64 / 1_048_576.0;
-	let ratio = if stats.total_core_bytes > 0 {
-		stats.total_original_bytes as f64 / stats.total_core_bytes as f64
-	} else {
-		1.0
-	};
-	println!();
-	println!("Model: {}", stats.model_name);
-	println!("Tensors: {}", stats.tensor_count);
-	println!("Original: {:.1} MB", orig_mb);
-	println!("Core:     {:.1} MB", core_mb);
-	println!("Sandbag:  {:.1} MB", sand_mb);
-	println!("Ratio:    {:.2}x", ratio);
-	for t in &stats.tensors {
-		if t.full_precision {
-			println!("  [FP]  {}", t.name);
+/// Report what actually landed on disk by reading the sandbag file back.
+fn print_summary(dst: &Path) {
+	use agent_harness::models::format::SandbagReader;
+
+	let reader = match SandbagReader::from_path(dst) {
+		Ok(r) => r,
+		Err(e) => {
+			eprintln!("Wrote {} but could not read it back: {}", dst.display(), e);
+			return;
 		}
-	}
+	};
+	let sand_mb = reader.header().total_data_bytes as f64 / 1_048_576.0;
+	println!();
+	println!("Output:   {}", dst.display());
+	println!("Tensors:  {}", reader.header().num_tensors);
+	println!("Sandbag:  {:.1} MB", sand_mb);
 }

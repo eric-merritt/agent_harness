@@ -1,0 +1,3 @@
+[build]
+# Keeps this worktree's build artifacts isolated from your main branch
+target-dir = "target-worktree"
