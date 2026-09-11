@@ -1,0 +1,258 @@
+#version 450
+//
+// Trellis bit quantizer — Vulkan 1.3 compute (no lookups, no CUDA, vendor-agnostic).
+//
+// One workgroup = one 32×32 weight tile = one tail-biting trellis ring of length 1024.
+// The tile is staged into shared memory at entry; the Viterbi DP then runs entirely in
+// registers + shared, fragmenting the ring into sequential 32-step sliding windows so the
+// backpointer history never exceeds one 8 KB window on-chip:
+//
+//     per window : forward cost pass (256 states) → backward traceback through bp[]
+//                  → bit-pack the K-bit stream → stream packed bytes to binding 1 NOW
+//
+// State width is 8 bits → 256 states. Cost row = 256×u32 = 1 KB, backpointer window =
+// 32×256 u8 = 8 KB — both fit the Ada 99 KB/workgroup limit with room to spare. A 16-bit
+// (65,536-state) table would be 256 KB and is rejected by design.
+//
+// ── ZERO LOOKUPS ────────────────────────────────────────────────────────────────
+// No codebook table, no transition LUT, ever. Every decoded symbol is computed from its
+// index by the mul1 lattice formula (one mul + one and + one add → fp16 bits):
+//     decode(i) = half_bits( ((i * 0x83DCD12Du) & 0xFFFFu) + 0x6400 )
+// The DP transition output for state s is decode(low-K-bits(s)); the cost compare is a
+// plain integer `<` on fixed-point (shift-scaled) squared error.
+//
+// ── BINDINGS (mirror hessian_estimate.comp) ─────────────────────────────────────
+//   binding 0 : one flat f32 arena, three regions back-to-back:
+//               [0 .. n_act)                     = plaintext calibration activations x
+//               [n_act .. n_act + n_out)         = scratch (unused here, kept for layout)
+//               [n_act + n_out .. )              = per-tile K-bit rate map (one u32/tile)
+//   binding 1 : paged sparse weight region — the packed trellis output lands here, one
+//               (1024·K/8)-byte stream + one fp16 scale per tile, back-to-back.
+//
+// ── WARP SHAPE / REGISTER FILE ──────────────────────────────────────────────────
+// local_size_x = 32, local_size_y = 4 : one Ada warp per row of the tile grid (128 lanes
+// = exactly the tile). Lane (x,y) owns tile element (x,y); the DP cost rows live in
+// shared and fold across the warp with subgroup shuffles.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(std430, binding = 0) buffer Activations {
+    float data[];
+} abuf;
+
+// Packed trellis output stream (bytes). Addressed as u32 words.
+layout(std430, binding = 1) buffer WeightOut {
+    uint wdata[];
+} wbuf;
+
+layout(push_constant) uniform Push {
+    uint n_tiles;     // tiles in this layer's grid (grid.x extent == n_tiles)
+    uint seed;        // kept for layout parity with the sibling estimator
+} pc;
+
+// Per-tile rate map: one u32 K per tile, uploaded by the host before dispatch. Each
+// workgroup reads its own K from gl_WorkGroupID.x — no per-tile push constant, so the
+// whole grid is ONE cmd_dispatch.
+layout(std430, binding = 2) buffer RateMap {
+    uint kmap[];
+} rbuf;
+
+const uint TILE = 32u;
+const uint RING = TILE * TILE;   // 1024 elements per tile ring
+const uint NSTATE = 256u;        // 8-bit trellis states (QTIP/TCQ-class)
+const uint WIN = 32u;            // sliding window: 32 ring steps per on-chip traceback
+
+// ── Shared memory (the whole DP lives here — nothing spills to global mid-pass). ──
+shared float wt[RING];                       // the tile, staged once at entry (4 KB)
+shared uint cost[NSTATE];                    // current Viterbi cost row (1 KB)
+shared uint bcost[NSTATE];                   // scratch next-row during a step (1 KB)
+shared int8_t bp[WIN][NSTATE];               // backpointer window: 32 steps × 256 (8 KB)
+shared float rms_warp[4];                    // per-warp partial sum for the rms reduce
+
+// ── mul1 lattice decode — pure arithmetic, no table. ───────────────────────────
+// i is the K low bits of a state; returns the fp16 codebook value as an f32.
+float mul1_decode(uint i) {
+    uint hw = (i * 0x83DCD12Du) & 0xFFFFu;   // magic-constant lattice step
+    hw += 0x6400u;                            // bias into the positive half range
+    return unpackHalf2x16(hw).x;
+}
+
+// Fixed-point squared error: (a - b)^2 scaled by 2^SHIFT, returned as uint. The shift
+// keeps the product in integer land so the min-select is a plain `<` — no float compare.
+uint fp_sq_err(float a, float b) {
+    float d = a - b;
+    // Round |d| to an integer of ~2^-10 resolution, clamp, square in 64-bit-free u32 space.
+    uint m = uint(clamp(abs(d) * 1024.0, 0.0, 65535.0));
+    return (m * m) >> 4;   // /16 to stay well under u32 overflow for |d|<=~8
+}
+
+// One Viterbi step over the trellis graph. Each target state t has EXACTLY two legal
+// incoming predecessors — its parent with a 0-bit or 1-bit shifted in:
+//     pred(t, b) = ((t << 1) | b) & 0xFF      (b ∈ {0,1})
+// so the per-target min is over TWO candidates, not all 256 states. The symbol emitted on
+// the transition out of predecessor s is decode(low-K-bits(s)) — pure mul1 arithmetic, no
+// table. All 256 targets are covered by the 64 active lanes (two targets each); warps 2,3
+// sit out this step and rejoin at the barrier. `mask` is this tile's (1<<K)-1, read from
+// the per-tile rate map — K varies per tile, so it is NOT a push constant.
+void viterbi_step(float x, uint step_in_win, uint mask) {
+    uint lane = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 32u;
+    if (lane >= 64u) return;   // 64 lanes × 2 targets = 256 states
+
+    uint t0 = lane * 2u;
+    uint t1 = lane * 2u + 1u;
+
+    // Target t0: min over its two legal predecessors.
+    {
+        uint p0 = ((t0 << 1u) | 0u) & 0xFFu;
+        uint p1 = ((t0 << 1u) | 1u) & 0xFFu;
+        float s0 = mul1_decode(p0 & mask);
+        float s1 = mul1_decode(p1 & mask);
+        uint c0 = cost[p0] + fp_sq_err(x, s0);
+        uint c1 = cost[p1] + fp_sq_err(x, s1);
+        if (c1 < c0) { c0 = c1; p0 = p1; }
+        bcost[t0] = c0; bp[step_in_win][t0] = int8_t(p0);
+    }
+    // Target t1: same, two legal predecessors.
+    {
+        uint p0 = ((t1 << 1u) | 0u) & 0xFFu;
+        uint p1 = ((t1 << 1u) | 1u) & 0xFFu;
+        float s0 = mul1_decode(p0 & mask);
+        float s1 = mul1_decode(p1 & mask);
+        uint c0 = cost[p0] + fp_sq_err(x, s0);
+        uint c1 = cost[p1] + fp_sq_err(x, s1);
+        if (c1 < c0) { c0 = c1; p0 = p1; }
+        bcost[t1] = c0; bp[step_in_win][t1] = int8_t(p0);
+    }
+}
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= pc.n_tiles) return;
+
+    // This tile's rate, read once from the per-tile map (uniform across the workgroup).
+    uint K = rbuf.kmap[tile_idx];
+    uint mask = (K > 0u) ? ((1u << K) - 1u) : 0u;
+
+    // ── Stage the 32×32 tile into shared once (cooperative, coalesced). ──────────
+    uint n_in = TILE * TILE;                  // tile is always 32×32 by construction
+    // The plaintext calibration activations for this tile are pre-staged by the host in
+    // binding 0's scratch half at [tile_idx*RING .. +RING) — we OVERWRITE binding 1 with
+    // packed output, so the input must come from the activation arena.
+    uint src_base = n_in;   // scratch base in elements (see header layout)
+    for (uint i = gl_LocalInvocationIndex; i < RING; i += 128u) {
+        wt[i] = abuf.data[src_base + tile_idx * RING + i];
+    }
+    barrier();
+
+    // ── Per-tile scale: rms(tile). Full workgroup reduce (4 warps → shared). ──────
+    float acc = 0.0;
+    for (uint i = gl_LocalInvocationIndex; i < RING; i += 128u) { acc += wt[i] * wt[i]; }
+    // Intra-warp fold first (cheap shuffle), then one shared slot per warp, barrier, sum.
+    float r = acc;
+    for (uint m = 16u; m > 0u; m >>= 1) { r += subgroupShuffleXor(r, m); }
+    if (gl_LocalInvocationID.x == 0u) { rms_warp[gl_LocalInvocationID.y] = r; }
+    barrier();
+    float rms = sqrt((rms_warp[0] + rms_warp[1] + rms_warp[2] + rms_warp[3]) / float(RING));
+
+    // ── Sliding-window Viterbi over the 1024-ring, 32 steps per window. ─────────
+    // cost[] starts uniform (state 0 preferred via tiny bias so the ring has a seed).
+    for (uint s = gl_LocalInvocationIndex; s < NSTATE; s += 128u) {
+        cost[s] = (s == 0u) ? 0u : 1u;   // seed: state 0 starts free, others pay 1
+    }
+    barrier();
+
+    // Packed stream for THIS tile starts at word `out_word_base` in binding 1. Each tile's
+    // stream is (RING*K bits → words) + 1 trailing fp16-scale word, laid out back-to-back.
+    uint stream_words = (RING * K + 7u) / 8u / 4u;   // whole words in the bitstream
+    uint out_word_base = tile_idx * (stream_words + 1u);  // +1 for the scale word slot
+
+    for (uint w = 0u; w < RING / WIN; ++w) {
+        // ── Forward pass over this window's 32 steps, recording bp[]. ────────────
+        for (uint st = 0u; st < WIN; ++st) {
+            uint pos = w * WIN + st;              // ring position
+            float x = wt[pos];
+            viterbi_step(x, st, mask);
+            barrier();                            // all lanes done writing bcost[]/bp[st]
+
+            // Swap cost <-> bcost. Barrier BEFORE so no lane reads cost[] while another
+            // is still mid-swap; barrier AFTER so the swap is globally visible before the
+            // next viterbi_step reads cost[].
+            barrier();
+            for (uint s = gl_LocalInvocationIndex; s < NSTATE; s += 128u) {
+                uint tmp = cost[s]; cost[s] = bcost[s]; bcost[s] = tmp;
+            }
+            barrier();
+        }
+         // ── Traceback and dump directly to scratch pad ───────────────────────────
+        if (gl_LocalInvocationID.y == 0u) {
+            uint lane = gl_LocalInvocationID.x; // 0..31
+
+            // 1. Parallel 256-State Min-Cost State Reduction
+            uint min_c = cost[lane];
+            uint min_idx = lane;
+            for (uint stride = 32u; stride < NSTATE; stride += 32u) {
+                uint c = cost[lane + stride];
+                if (c < min_c) { min_c = c; min_idx = lane + stride; }
+            }
+
+            for (uint offset = 16u; offset > 0u; offset >>= 1) {
+                uint remote_c = subgroupShuffleXor(min_c, offset);
+                uint remote_idx = subgroupShuffleXor(min_idx, offset);
+                if (remote_c < min_c) { min_c = remote_c; min_idx = remote_idx; }
+            }
+            uint cur_state = subgroupShuffle(min_idx, 0u);
+
+            // 2. Parallel Traceback: Reconstruct the path backwards
+            uint my_step_state = 0u;
+            for (int step = int(WIN) - 1; step >= 0; --step) {
+                if (int(lane) == step) {
+                    my_step_state = cur_state;
+                }
+                cur_state = uint(bp[step][cur_state]);
+            }
+
+            // 3. Dump the un-packed K-bit symbol directly into the scratch pad
+            uint ring_pos = w * WIN + lane;
+            // Scratch offset starts exactly at n_act (which is src_base by design)
+            uint scratch_idx = src_base + tile_idx * RING + ring_pos;
+            abuf.data[scratch_idx] = float(my_step_state & mask);
+        }
+        barrier(); // Wait for scratch write to finish before moving to the next window
+    }
+
+    // ── Coalesced Bit-Packing Pass via Scratch Pad ───────────────────────────────
+    // The entire 1024-ring is now unwrapped in scratch. We use the full 128-lane workgroup 
+    // to read, pack, and stream out the words sequentially.
+    uint total_words = stream_words;
+    for (uint w_idx = gl_LocalInvocationIndex; w_idx < total_words; w_idx += 128u) {
+        uint bit_start = w_idx * 32u;
+        uint local_packed = 0u;
+
+        // Pack 32 bits sequentially into this word
+        for (uint b = 0u; b < 32u; ++b) {
+            uint global_bit = bit_start + b;
+            uint symbol_idx = global_bit / K;
+            uint bit_offset = global_bit % K;
+
+            if (symbol_idx < RING) {
+                uint scratch_idx = src_base + tile_idx * RING + symbol_idx;
+                uint symbol = uint(abuf.data[scratch_idx]);
+                uint bit = (symbol >> bit_offset) & 1u;
+                local_packed |= (bit << b);
+            }
+        }
+        // Perfect coalesced global write
+        wbuf.wdata[out_word_base + w_idx] = local_packed;
+    }
+
+    // ── Trailing fp16 scale ──────────────────────────────────────────────────────
+    if (gl_LocalInvocationIndex == 0u) {
+        uint scale_bits = packHalf2x16(vec2(rms, 0.0));
+        wbuf.wdata[out_word_base + stream_words] = scale_bits;
+    }
+}

@@ -1,0 +1,127 @@
+    zero_out_scales = out_channel_scales.abs() < 1e-30
+
+    if apply_out_scales:
+        out_channel_scales[zero_out_scales] = 0.1
+        sv = (sv * out_channel_scales + 1e-10).float()
+        if verbose:
+            out_channel_std = out_channel_scales.std().item()
+            out_channel_mean = out_channel_scales.mean().item()
+            print(f"     - out ch scales std/mean: {out_channel_std:.6f}   {out_channel_mean:.6f}")
+
+    # Output sign flips (and scales)
+    weight /= sv
+
+    # Force zero output channels to zero
+    sv[zero_out_scales] = 0.0
+
+    # Output hadamard transform
+    blockwise_preapply_had_r_(weight, had_n)
+
+    # Input sign flips and scales
+    in_channel_scales = block_rms(weight, dim = 1, keepdim = True)
+    in_channel_scales[in_channel_scales.abs() < 1e-30] = 0.1
+    su = (su * in_channel_scales / (-codebook_scale) + 1e-10).float()  # mustn't be inplace
+    weight /= su
+    blockwise_preapply_had_l_(weight, had_k)
+
+    # Determine best scale for matrix by test quantizing a sample of tiles along a wrapped diagonal
+    if not skip_g_scale:
+        g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    else:
+        g_scale = 1.0
+        mse_scale = None
+    weight *= g_scale
+    su /= g_scale
+
+    # ext.test_distribution(weight_os, dist_r, dist_ref, -3.8, 3.8)
+    # js_os = jsd(dist_r, dist_ref)
+
+    if verbose:
+        print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
+        print(f"     - global scale: {g_scale:.6f}")
+        if mse_scale is not None: print(f"     - sample mse: {mse_scale.item():.6f}")
+        print(f"     - apply_out_scales: {str(apply_out_scales)}")
+
+    return apply_out_scales, weight, g_scale, su, sv
+
+===CODEBOOK===
+#pragma once
+
+// This used to force integer MAD on sm_86 via inline asm, which outperformed the IMUL emitted by older
+// nvcc versions on the RTX 3090. As of CUDA 13.2 the workaround has inverted: the plain multiply is ~4%
+// faster end-to-end at m=1. Kept as a hook in case it regresses again.
+template <uint32_t w>
+__device__ __forceinline__
+uint32_t mul_const_u32(uint32_t x)
+{
+    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+        uint32_t r;
+        asm volatile (
+            "{ .reg .u32 z,t;"
+            "  mov.u32 t, %laneid;"   // runtime SR
+            "  sub.u32 z, t, t;"      // z = 0 but data-dependent
+            "  mad.lo.u32 %0, %1, %2, z;"
+            "}"
+            : "=r"(r)
+            : "r"(x), "n"(w));
+        return r;
+    #else
+        return x * w;
+    #endif
+}
+
+// Decode two mul1 (cb 2) codebook entries from precomputed products x0 = idx0 * 0x83DCD12D,
+// x1 = idx1 * 0x83DCD12D
+__device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
+{
+    const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
+    // uint32_t sum0;
+    // uint32_t sum1;
+    // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(acc) : );
+    // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(acc) : );
+    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
+    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+    half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
+    half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
+    half_uint16 h0((uint16_t) sum0);
+    half_uint16 h1((uint16_t) sum1);
+    return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
+}
+
+// Ditto mcg (cb 1)
+__device__ inline half2 decode_mcg_product_2(uint32_t x0, uint32_t x1)
+{
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x0));
+    asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x1));
+    half2_uint32 xu0(x0);
+    half2_uint32 xu1(x1);
+    half2 d0 = __lows2half2(xu0.as_half2, xu1.as_half2);
+    half2 d1 = __highs2half2(xu0.as_half2, xu1.as_half2);
+    return __hadd2(d0, d1);
+}
+
+template <int cb>
+__device__ inline half decode_3inst(uint32_t x)
+{
+    if constexpr (cb == 0)
+    {
+        x *= 89226354u;
+        x += 64248484u;
+        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        half2_uint32 xu(x);
+        return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
+    }
+    if constexpr (cb == 1)
+    {
+        x *= 0xCBAC1FEDu;
+        // x = mul_const_u32<0xCBAC1FEDu>(x);
+
+        asm ("lop3.b32 %0, %0, 0x8fff8fff, 0x3b603b60, 0x6a;" : "+r"(x));
+        half2_uint32 xu(x);
+        return __hadd(__low2half(xu.as_half2), __high2half(xu.as_half2));
+    }
+    if constexpr (cb == 2)
+    {
+        x *= 0x83DCD12Du;
+        const uint32_t acc = 0x6400u;  // 0x6400 -> 1024.0 ..  0x67FF -> 2047.0
+        // Byte sum via dp4a, bit-identical to the previous vabsdiff4(x, 0, acc) but native on Blackwell

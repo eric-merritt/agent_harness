@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect, Size};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Style, Modifier};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use tui_scrollview::{ScrollView, ScrollViewState, ScrollbarVisibility};
@@ -26,6 +26,17 @@ const USER_FG: Color = Color::Rgb(0, 128, 128);
 const AGENT_FG: Color = Color::Rgb(180, 140, 220);
 /// Neon green for timestamps.
 const TIME_FG: Color = Color::Rgb(57, 255, 20);
+/// Header background — teal (user role color), since this panel sits next to a magenta button.
+const HEADER_BG: Color = Color::Rgb(0, 128, 128);
+/// Header text — white.
+const HEADER_FG: Color = Color::Rgb(255, 255, 255);
+
+/// Box-drawing characters for borders
+const LEFT: char = '\u{258E}';
+const BOTTOM: char = '\u{2581}';
+const RIGHT: char = '\u{258A}';
+const CORNER_BL: char = '\u{259D}';
+const CORNER_BR: char = '\u{2598}';
 
 pub struct MessagesPanel {
 	/// Shared reference to the message list.  Updated via sync().
@@ -217,46 +228,71 @@ impl MessagesPanel {
 			return;
 		}
 
-		let buf = frame.buffer_mut();
+		// Define edges & area bounds
+		let top = area.y;
 		let left = area.x;
 		let right = area.x + area.width - 1;
-		let top = area.y;
 		let bottom = area.y + area.height - 1;
 
+		// Define header row content & bounds
+		let header_y: u16 = top;
+		let header_text: &str = " Messages ";
+		let header_len = header_text.len() as u16;
+		let header_x = area.x + (area.width.saturating_sub(header_len)) / 2;
+
+		let buf = frame.buffer_mut();
 		let mut put = |x: u16, y: u16, ch: char, fg: Color, bg: Color| {
 			if let Some(cell) = buf.cell_mut((x, y)) {
 				cell.set_char(ch).set_fg(fg).set_bg(bg);
 			}
 		};
 
-		// Fill background
-		for y in top..=bottom {
+		// Fill background skipping top row for header
+		for y in top + 1..=bottom {
 			for x in left..=right {
 				put(x, y, ' ', PANEL_BG, PANEL_BG);
 			}
 		}
 
-		// TOP edge
-		for x in left + 1..right {
-			put(x, top, '▔', BORDER_FG, PANEL_BG);
-		}
 		// LEFT edge
 		for y in top + 1..bottom {
-			put(left, y, '▎', BORDER_FG, PANEL_BG);
+			put(left, y, LEFT, BORDER_FG, PANEL_BG);
 		}
 		// BOTTOM edge
 		for x in left + 1..right {
-			put(x, bottom, '▁', BORDER_FG, PANEL_BG);
+			put(x, bottom, BOTTOM, BORDER_FG, PANEL_BG);
 		}
 		// RIGHT edge — ▊ draws using BG color, so swap fg/bg
 		for y in top + 1..bottom {
-			put(right, y, '▊', PANEL_BG, BORDER_FG);
+			put(right, y, RIGHT, PANEL_BG, BORDER_FG);
 		}
-		// Corners
-		put(left, top, '▗', PANEL_BG, BORDER_FG);
-		put(right, top, '▖', PANEL_BG, BORDER_FG);
-		put(left, bottom, '▝', PANEL_BG, BORDER_FG);
-		put(right, bottom, '▘', PANEL_BG, BORDER_FG);
+
+		// Header row IS the top row — extends to outer edges, closing the panel
+		// Fill entire top row with header background, reaching the outer edges
+		for x in left..=right {
+			put(x, header_y, ' ', HEADER_BG, HEADER_BG);
+		}
+
+		// Header corner accents: upper-left quadrant on left, upper-right on right
+		let corner_fg = Color::Rgb(0, 60, 60); // dark teal
+		let corner_bg = Color::Rgb(0, 90, 90); // mildly dark teal (darker than header)
+		put(left, header_y, '\u{2598}', corner_fg, corner_bg); // ▘ upper-left
+		put(right, header_y, '\u{259D}', corner_fg, corner_bg); // ▝ upper-right
+
+		// Bottom corners
+		put(left, bottom, CORNER_BL, PANEL_BG, BORDER_FG);
+		put(right, bottom, CORNER_BR, PANEL_BG, BORDER_FG);
+
+		// Write header text with bold via set_string (put closure can't handle modifiers)
+		frame.buffer_mut().set_string(
+			header_x,
+			header_y,
+			header_text,
+			Style::default()
+				.fg(HEADER_FG)
+				.bg(HEADER_BG)
+				.add_modifier(Modifier::BOLD),
+		);
 
 		// Content area inside the border (1-cell inset for the border chars).
 		let content_area = area.inner(Margin {

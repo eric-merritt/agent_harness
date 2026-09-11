@@ -1,0 +1,18 @@
+/tmp/exv3/exllamav3/conversion/convert_model.py:401:        "K": K,
+/tmp/exv3/exllamav3/conversion/convert_model.py:426:        f"  bpw: {quant_args['K']:5.2f}"
+/tmp/exv3/exllamav3/conversion/ngram.py:88:        q, states = quantize_tiles((w / scale0).contiguous(), {"K": K, "mul1": True})
+/tmp/exv3/exllamav3/conversion/ngram.py:361:            "K": str(K),
+/tmp/exv3/exllamav3/conversion/ngram.py:448:        "K": K,
+/tmp/exv3/exllamav3/conversion/ngram.py:479:        self.K = int(self.metadata["K"])
+===
+compression
+conversion
+convert.rs
+format.rs
+hessian_estimate.comp
+hessian_estimate.spv
+mod.rs
+quantize.rs
+sandbag_quantize.comp
+sandbag_quantize.spv
+tensor.rs

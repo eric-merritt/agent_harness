@@ -74,6 +74,14 @@ path = "src/main.rs"
 name = "convert"
 path = "src/bin/convert.rs"
 
+[[bin]]
+name = "hessian_verify"
+path = "src/bin/hessian_verify.rs"
+
+[[bin]]
+name = "hessian_verify_real"
+path = "src/bin/hessian_verify_real.rs"
+
 [env]
 DATABASE_URL="postgres://ermer:ermer@localhost/agent_harness"
 

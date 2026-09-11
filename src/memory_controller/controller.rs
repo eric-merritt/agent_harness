@@ -6,8 +6,6 @@ use ash::vk;
 use gpu_allocator::vulkan::Allocator;
 use std::sync::{Arc, Mutex, OnceLock};
 use sysinfo::System;
-use std::ffi::c_void;
-use std::ffi::CStr;
 
 /// A block of model data to be paged into the arena.
 #[derive(Clone, Debug)]
@@ -42,6 +40,211 @@ pub struct QuantizePushConstants {
 	pub tail_digits: u32,
 	/// Saturation point from CPU-side calibration.
 	pub threshold: f32,
+}
+
+/// Per-dispatch parameters for the Hessian/Trellis sensitivity shader
+/// (`hessian_trellis.comp`). One workgroup = one 32×32 tile, so these address a single
+/// tile of the paged weight space plus the activation rows it reads. Layout must match the
+/// `push_constant` block in that shader exactly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HessianTrellisPushConstants {
+	/// Byte offset of this tile's 32×32 f16 block inside the weight (binding 1) arena.
+	pub tile_offset_bytes: u32,
+	/// nDim — elements per activation row. (Reserved; the shader indexes rows directly.)
+	pub act_row_stride: u32,
+	/// Element offset of the activation rows this tile reads (token·nDim into binding 0).
+	pub act_base_elem: u32,
+	/// First input-dim column this tile covers (a multiple of 32).
+	pub col0: u32,
+	/// Index into the output plane (binding 2) for this tile's vec4 result.
+	pub out_tile_index: u32,
+	/// Rademacher iterations to average — more gives a tighter Hessian estimate.
+	pub n_iters: u32,
+	/// Philox base seed; made unique per tile so projections decorrelate across tiles.
+	pub seed: u32,
+}
+
+// ── Task 1: Dual-Binding Sequential Memory Architecture ────────────────────────
+//
+// A host-side plan for the two descriptor bindings that drive one layer pass in the
+// alternating execution loop. It is pure layout math — no Vulkan handles — so it can be
+// constructed, inspected and unit-tested on the CPU before a device exists. The actual
+// buffers are created once (pre-allocated) and these structs only name which pre-allocated
+// block plays which role this pass, plus the exact byte sizes the allocator must honour.
+//
+// Nothing here is hardcoded to a model shape: every size is derived from the layer's
+// (tokens, nDim_in, nDim_out) triple through the formulas in the spec, so the same code
+// serves both square Attention layers and wide SwiGLU FFN expansions.
+
+/// The two physical blocks behind binding 0. Identical in size; they swap roles every
+/// layer pass (ping-pong). Block A is "read" this pass while block B accumulates, then
+/// the barrier at end-of-pass promotes B's scratch into next pass's read-only input and
+/// the roles flip. `active` is which block is the READ-ONLY INPUT this pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PingPongRole {
+	/// This block holds the layer's input activations (read-only) for this pass.
+	ReadInput,
+	/// This block is the writable scratch accumulator (zeroed at pass start, atomicAdd).
+	WriteScratch,
+}
+
+/// Per-pass view of the ping-pong activation space behind binding 0.
+#[derive(Clone, Copy, Debug)]
+pub struct PingPongActivation {
+	/// Bytes in ONE activation block: tokens × nDim × 4 (FP32). Both blocks are this size.
+	pub block_bytes: u64,
+	/// Which physical block (0 = A, 1 = B) is the read-only input THIS pass.
+	pub active_read_block: usize,
+}
+
+impl PingPongActivation {
+	/// Size formula: Sequence Length (Tokens) × Hidden Dimension (nDim) × 4 bytes (FP32).
+	///
+	/// For a 5,120-wide hidden dimension at 4,096 tokens this is exactly 83,886,080 bytes
+	/// (80.00 MiB). Both pre-allocated blocks are this size.
+	pub fn new(tokens: u64, n_dim: u64) -> Self {
+		let block_bytes = tokens * n_dim * 4;
+		Self {
+			block_bytes,
+			active_read_block: 0,
+		}
+	}
+
+	/// The read-only input block's byte range within the activation arena.
+	pub fn read_input_range(&self) -> (u64, u64) {
+		(self.active_read_block as u64 * self.block_bytes, self.block_bytes)
+	}
+
+	/// The writable scratch block's byte range — the one NOT being read this pass.
+	pub fn write_scratch_range(&self) -> (u64, u64) {
+		let scratch_block = 1 - self.active_read_block;
+		(scratch_block as u64 * self.block_bytes, self.block_bytes)
+	}
+
+	/// Flip roles for the next layer pass: this pass's scratch becomes next pass's input.
+	pub fn advance(&mut self) {
+		self.active_read_block = 1 - self.active_read_block;
+	}
+}
+
+/// A single weight tensor page inside the paged sparse tile space (binding 1).
+#[derive(Clone, Copy, Debug)]
+pub struct WeightTilePage {
+	/// Input dimension (nDim_in) of this tensor. Must be a multiple of 32 for tiling.
+	pub n_dim_in: u64,
+	/// Output dimension (nDim_out) of this tensor. Multiple of 32; may exceed n_dim_in
+	/// for wide FFN expansion layers (SwiGLU up/gate).
+	pub n_dim_out: u64,
+	/// Byte offset of this page's first tile within the weight arena.
+	pub offset_bytes: u64,
+}
+
+impl WeightTilePage {
+	/// Sizing formula: nDim_in × nDim_out × 2 bytes (FP16).
+	pub fn size_bytes(&self) -> u64 {
+		self.n_dim_in * self.n_dim_out * 2
+	}
+
+	/// The tile grid. Each tile is 32×32 elements; the whole tensor must tile exactly, so
+	/// both dims are required to be multiples of 32 (true for square attention and for the
+	/// 5120→17408 SwiGLU expansion alike).
+	pub fn tile_grid(&self) -> (u64, u64) {
+		(self.n_dim_in / 32, self.n_dim_out / 32) // (horizontal, vertical) tiles
+	}
+
+	/// Number of 2 KB (32×32 FP16) tiles in this page.
+	pub fn tile_count(&self) -> u64 {
+		let (h, v) = self.tile_grid();
+		h * v
+	}
+
+	/// Bytes per tile: 32 × 32 elements × 2 bytes (FP16) = 2048.
+	pub const TILE_BYTES: u64 = 32 * 32 * 2;
+}
+
+/// The paged, read-only FP16 weight tile space behind binding 1.
+///
+/// Weights are laid out as a continuous linear run of 32×32 FP16 tiles, entirely separate
+/// from the activation arena so each stays cache-aligned on its own alignment boundary.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightTileSpace {
+	/// Total bytes reserved for every weight page in this space.
+	pub total_bytes: u64,
+	/// One 32×32 FP16 tile is always exactly this many bytes.
+	pub tile_bytes: u64,
+}
+
+impl WeightTileSpace {
+	/// Build a paged weight space from a list of tensor shapes (one per layer tensor).
+	///
+	/// Pages are packed back-to-back with no interior padding, so page *n*'s offset equals
+	/// the sum of every earlier page's size — the same running-sum invariant the arena paging
+	/// relies on. Square attention (5120×5120) and wide FFN (5120×17408) both tile exactly.
+	pub fn new(tensor_shapes: &[(u64, u64)]) -> Self {
+		let mut total_bytes = 0u64;
+		for &(n_dim_in, n_dim_out) in tensor_shapes {
+			debug_assert_eq!(n_dim_in % 32, 0, "nDim_in must tile by 32");
+			debug_assert_eq!(n_dim_out % 32, 0, "nDim_out must tile by 32");
+			total_bytes += n_dim_in * n_dim_out * 2;
+		}
+		Self {
+			total_bytes,
+			tile_bytes: WeightTilePage::TILE_BYTES,
+		}
+	}
+
+	/// Lay out `tensor_shapes` into consecutive pages. Returns each page's offset so the
+	/// caller can hand the running-sum layout to the upload path.
+	pub fn plan_pages(&self, tensor_shapes: &[(u64, u64)]) -> Vec<WeightTilePage> {
+		let mut pages = Vec::with_capacity(tensor_shapes.len());
+		let mut offset = 0u64;
+		for &(n_dim_in, n_dim_out) in tensor_shapes {
+			pages.push(WeightTilePage {
+				n_dim_in,
+				n_dim_out,
+				offset_bytes: offset,
+			});
+			offset += n_dim_in * n_dim_out * 2;
+		}
+		pages
+	}
+}
+
+/// The full per-pass descriptor layout for one layer of the alternating loop.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerBindingLayout {
+	/// binding = 0: ping-pong activation space (input read + scratch write).
+	pub activations: PingPongActivation,
+	/// binding = 1: this layer's weight tensor page inside the paged tile space.
+	pub weights: WeightTilePage,
+}
+
+impl LayerBindingLayout {
+	/// Assemble a per-pass layout from the shared activation space (sized once for the
+	/// whole model by its max hidden dim and token budget) and this layer's weight shape.
+	pub fn new(activations: PingPongActivation, n_dim_in: u64, n_dim_out: u64, offset_bytes: u64) -> Self {
+		Self {
+			activations,
+			weights: WeightTilePage {
+				n_dim_in,
+				n_dim_out,
+				offset_bytes,
+			},
+		}
+	}
+
+	/// The FFN intermediate dimension for a SwiGLU layer, rounded up to the next multiple of
+	/// 32 so the expansion tiles exactly.
+	///
+	/// NOTE: this is taken from the model's own config (`intermediate_size`), NOT derived
+	/// from the hidden dim — Qwen checkpoints pick it independently and the ratio is not a
+	/// clean constant (for the 5,120-hidden baseline the real value is 17,408, i.e. ×3.4,
+	/// which is *not* 8/3 despite what older notes claim). The caller passes the checkpoint's
+	/// actual number; this only guarantees it tiles by 32 and reports it back.
+	pub fn swiglu_intermediate(inter_dim: u64) -> u64 {
+		(inter_dim + 31) / 32 * 32
+	}
 }
 
 // GPU context — holds Vulkan device, queue, allocator, and command pool handles.
@@ -186,7 +389,15 @@ impl GpuContext {
 		pooled: &std::sync::Mutex<Vec<vk::CommandBuffer>>,
 	) {
 		unsafe {
-			device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			let result = device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			match result {
+				Ok(_) => {
+					println!("Successfully recycled command buffer.");
+				},
+				Err(_) => {
+					eprintln!("Failed to recycle command buffer.");
+				}
+			}
 		}
 		pooled.lock().unwrap().push(cmd);
 	}
@@ -416,10 +627,18 @@ impl GpuContext {
 		// Recycle fence and command buffer
 		unsafe {
 			Self::recycle_fence(&self.device_handle, fence, &self.fence_pool);
-			self.device_handle
-				.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
-			self.cmd_buffer_pool.lock().unwrap().push(cmd);
+			let result = self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
+			match result {
+				Ok(_) => {
+					println!("Successfully recycled fence and command buffer. Pushing.");
+					self.cmd_buffer_pool.lock().unwrap().push(cmd);
+				},
+				Err(_) => {
+					eprintln!("Failed to recycle command buffer. Attempting recovery.");
+				}
+			}
 		}
+
 	}
 
 	/// Synchronous download: copy `size` bytes from `buf` at `offset` into a Vec.
@@ -1037,6 +1256,181 @@ impl MemoryController {
 		)
 	}
 
+	/// Locate the compiled Hessian/Trellis sensitivity shader (runtime-loaded, optional).
+	fn find_hessian_spirv() -> Option<Vec<u8>> {
+		let mut candidates: Vec<std::path::PathBuf> = vec![
+			std::path::PathBuf::from(concat!(
+				env!("CARGO_MANIFEST_DIR"),
+				"/src/models/hessian_trellis.spv"
+			)),
+			std::path::PathBuf::from("src/models/hessian_trellis.spv"),
+		];
+		if let Ok(exe) = std::env::current_exe() {
+			if let Some(dir) = exe.parent() {
+				candidates.push(dir.join("hessian_trellis.spv"));
+			}
+		}
+		for path in &candidates {
+			if let Ok(bytes) = std::fs::read(path) {
+				eprintln!("[CONTROLLER] loaded hessian shader from {}", path.display());
+				return Some(bytes);
+			}
+		}
+		None
+	}
+
+	/// Build the dual-binding Hessian/Trellis compute pipeline.
+	///
+	/// Three storage-buffer bindings: 0 = ping-pong activation space (read), 1 = paged FP16
+	/// weight tile space (read), 2 = per-tile output plane (write). Per-tile addressing goes
+	/// in push constants so the descriptor set stays immutable and one dispatch grid sweeps
+	/// every tile of a layer. Follows `create_quantize_pipeline`'s structure exactly.
+	fn create_hessian_pipeline(
+		device: &ash::Device,
+		activation_buffer: vk::Buffer,
+		weight_buffer: vk::Buffer,
+		output_buffer: vk::Buffer,
+	) -> (
+		vk::Pipeline,
+		vk::PipelineLayout,
+		vk::DescriptorSetLayout,
+		vk::DescriptorPool,
+		vk::DescriptorSet,
+	) {
+		let bindings = [
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(0)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(1)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(2)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+		];
+
+		let set_layout = unsafe {
+			device
+				.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
+				.expect("create hessian descriptor set layout")
+		};
+
+		let push_range = vk::PushConstantRange::default()
+			.stage_flags(vk::ShaderStageFlags::COMPUTE)
+			.offset(0)
+			.size(std::mem::size_of::<HessianTrellisPushConstants>() as u32);
+
+		let pipeline_layout = unsafe {
+			device
+				.create_pipeline_layout(
+					&vk::PipelineLayoutCreateInfo::default()
+						.set_layouts(std::slice::from_ref(&set_layout))
+						.push_constant_ranges(std::slice::from_ref(&push_range)),
+					None,
+				)
+				.expect("create hessian pipeline layout")
+		};
+
+		let pool_size = vk::DescriptorPoolSize::default()
+			.ty(vk::DescriptorType::STORAGE_BUFFER)
+			.descriptor_count(3);
+
+		let descriptor_pool = unsafe {
+			device
+				.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(std::slice::from_ref(&pool_size)), None)
+				.expect("create hessian descriptor pool")
+		};
+
+		let descriptor_set = unsafe {
+			device
+				.allocate_descriptor_sets(
+					&vk::DescriptorSetAllocateInfo::default()
+						.descriptor_pool(descriptor_pool)
+						.set_layouts(std::slice::from_ref(&set_layout)),
+				)
+				.expect("allocate hessian descriptor set")[0]
+		};
+
+		let act_info = vk::DescriptorBufferInfo::default().buffer(activation_buffer).offset(0).range(vk::WHOLE_SIZE);
+		let wgt_info = vk::DescriptorBufferInfo::default().buffer(weight_buffer).offset(0).range(vk::WHOLE_SIZE);
+		let out_info = vk::DescriptorBufferInfo::default().buffer(output_buffer).offset(0).range(vk::WHOLE_SIZE);
+
+		unsafe {
+			device.update_descriptor_sets(
+				&[
+					vk::WriteDescriptorSet::default()
+						.dst_set(descriptor_set)
+						.dst_binding(0)
+						.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+						.buffer_info(std::slice::from_ref(&act_info)),
+					vk::WriteDescriptorSet::default()
+						.dst_set(descriptor_set)
+						.dst_binding(1)
+						.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+						.buffer_info(std::slice::from_ref(&wgt_info)),
+					vk::WriteDescriptorSet::default()
+						.dst_set(descriptor_set)
+						.dst_binding(2)
+						.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+						.buffer_info(std::slice::from_ref(&out_info)),
+				],
+				&[],
+			);
+		}
+
+		let spirv = match Self::find_hessian_spirv() {
+			Some(bytes) => bytes,
+			None => {
+				eprintln!(
+					"[CONTROLLER] hessian_trellis.spv not found — Hessian/Trellis pipeline disabled. \
+					 Compile it with: glslangValidator --target-env vulkan1.3 -o \
+					 src/models/hessian_trellis.spv src/models/hessian_trellis.comp"
+				);
+				return (vk::Pipeline::null(), pipeline_layout, set_layout, descriptor_pool, descriptor_set);
+			}
+		};
+
+		let words: Vec<u32> = spirv.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+		let shader_module = unsafe {
+			device
+				.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+				.expect("create hessian shader module")
+		};
+
+		let entry_name = c"main";
+		let stage = vk::PipelineShaderStageCreateInfo::default()
+			.stage(vk::ShaderStageFlags::COMPUTE)
+			.module(shader_module)
+			.name(entry_name);
+
+		let pipeline = unsafe {
+			device
+				.create_compute_pipelines(
+					vk::PipelineCache::null(),
+					&[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
+					None,
+				)
+				.expect("create hessian compute pipeline")[0]
+		};
+
+		unsafe { device.destroy_shader_module(shader_module, None) };
+
+		(
+			pipeline,
+			pipeline_layout,
+			set_layout,
+			descriptor_pool,
+			descriptor_set,
+		)
+	}
+
 	// /// Dynamically inspects the host OS and Vulkan physical device to initialize the arena
 	// /// with zero hardcoded constraints.
 	// /// The `device` parameter may have been created from an instance that is already dropped;
@@ -1560,5 +1954,73 @@ mod tests {
 			size: 99,
 		}];
 		assert!(plan_pages(&src, &blocks, 64).is_err());
+	}
+
+	// ── Task 1: dual-binding layout sizing invariants ────────────────────────
+
+	#[test]
+	fn ping_pong_activation_matches_spec_bytes() {
+		// 5,120 hidden dim at 4,096 tokens → exactly 83,886,080 bytes (80.00 MiB).
+		let act = PingPongActivation::new(4096, 5120);
+		assert_eq!(act.block_bytes, 83_886_080);
+
+		// The two blocks are identical and tile the activation arena with no gap.
+		let (r_off, r_len) = act.read_input_range();
+		let (s_off, s_len) = act.write_scratch_range();
+		assert_eq!(r_len, s_len);
+		assert_eq!(r_off + r_len, s_off, "read block and scratch block must be adjacent");
+		assert_eq!(s_off + s_len, 2 * act.block_bytes);
+
+		// Advancing flips roles: what was scratch is now the read input.
+		let mut a = PingPongActivation::new(4096, 5120);
+		let before = a.read_input_range().0;
+		a.advance();
+		assert_eq!(a.read_input_range().0, s_off);
+		assert_ne!(before, a.read_input_range().0);
+	}
+
+	#[test]
+	fn square_attention_tiles_exactly() {
+		// 5120 × 5120 FP16 → exactly 52,428,800 bytes (50.00 MiB), a 160×160 tile grid.
+		let page = WeightTilePage { n_dim_in: 5120, n_dim_out: 5120, offset_bytes: 0 };
+		assert_eq!(page.size_bytes(), 52_428_800);
+		assert_eq!(page.tile_grid(), (160, 160));
+		assert_eq!(page.tile_count(), 25_600);
+	}
+
+	#[test]
+	fn swiglu_ffn_expansion_tiles_exactly() {
+		// The 5,120-hidden baseline checkpoint's real FFN intermediate is 17,408 (a ×3.4
+		// expansion — NOT 8/3; older notes mislabeled it). It comes from the model config,
+		// so we pass it in and only assert it tiles by 32 and sizes correctly.
+		let inter = LayerBindingLayout::swiglu_intermediate(17_408);
+		assert_eq!(inter, 17_408); // already a multiple of 32 → unchanged
+
+		let page = WeightTilePage { n_dim_in: 5120, n_dim_out: inter, offset_bytes: 0 };
+		assert_eq!(page.size_bytes(), 178_257_920);
+		assert_eq!(page.tile_grid(), (160, 544));
+		assert_eq!(page.tile_count(), 87_040);
+
+		// A non-tileable intermediate gets rounded up to the next 32-multiple.
+		assert_eq!(LayerBindingLayout::swiglu_intermediate(17_409), 17_440);
+	}
+
+	#[test]
+	fn weight_pages_pack_by_running_sum() {
+		// Square attention + FFN up + FFN gate packed back-to-back: each page's offset is
+		// the sum of every earlier page's size, and the total matches the arena bytes.
+		let shapes = [(5120u64, 5120u64), (5120, 17408), (5120, 17408)];
+		let space = WeightTileSpace::new(&shapes);
+		let pages = space.plan_pages(&shapes);
+
+		assert_eq!(pages.len(), shapes.len());
+		let mut expected_offset = 0u64;
+		for p in &pages {
+			assert_eq!(p.offset_bytes, expected_offset, "page offset must be the running sum");
+			expected_offset += p.size_bytes();
+		}
+		assert_eq!(expected_offset, space.total_bytes);
+		assert_eq!(space.tile_bytes, WeightTilePage::TILE_BYTES);
+		assert_eq!(WeightTilePage::TILE_BYTES, 2048); // 32×32 FP16 = one 2 KB tile
 	}
 }

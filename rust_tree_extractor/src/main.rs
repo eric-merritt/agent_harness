@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]

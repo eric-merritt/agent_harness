@@ -16,4 +16,7 @@
 pub mod controller;
 pub mod cpu_mem_op;
 pub mod gpu_mem_op;
+pub mod hessian;
+pub mod pingpong;
 pub mod virtual_tensor_arena;
+

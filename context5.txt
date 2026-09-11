@@ -1,0 +1,51 @@
+15:had_k, had_n = 128, 128
+22:def tensor_core_perm(device):
+48:def tensor_core_perm_i(device):
+53:def get_temp_buffers(device, K: int, tile_len: int = 256):
+68:def quantize_tiles(tiles, quant_args: dict):
+104:def get_quant_stream(device):
+109:def arch_prior_speed(device: int) -> float:
+120:class AutoSplit:
+128:    def __init__(self):
+132:    def report(self, kind: str, device: int, work: float, elapsed_s: float):
+141:    def ratios(self, kind: str, devices: list) -> list:
+150:    def has_measured(self, kind: str, devices: list) -> bool:
+168:def get_pinned(num_tiles: int):
+177:def quantize_tiles_multigpu(tiles, quant_args: dict):
+310:def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
+347:def preapply_had_l(x: torch.Tensor, had_dim):
+357:def preapply_had_r(x: torch.Tensor, had_dim):
+367:def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
+381:def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
+395:def save_failed_cholesky(H: torch.Tensor, quant_args: dict, debug_info: dict | None):
+418:def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_info: dict | None = None):
+495:def ldlq(
+614:def fallback_quant(
+732:def block_trace(A, B, block_size = 1024):
+746:def ldlq_batched(
+839:def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
+904:        blockwise_preapply_had_r_(H, had_k)
+906:        blockwise_preapply_had_l_(H, had_k)
+934:def pack_trellis(encoded: torch.Tensor, quant_args: dict) -> torch.Tensor:
+948:def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
+956:def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
+986:def g_scale_search_batch(
+1003:    def eval_pairs(pairs, tile_sets):
+1052:def g_scale_gss(
+1081:def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
+1097:def block_rms_n(x: torch.Tensor, dim: int = 0, blocksize: int = 32):
+1114:def block_nmse(x: torch.Tensor, y: torch.Tensor, dim: int = 0, blocksize: int = 32):
+1132:def regularize(
+1155:    def jsd(h1, h2):
+1212:    blockwise_preapply_had_r_(weight, had_n)
+1219:    blockwise_preapply_had_l_(weight, had_k)
+1242:def quantize_exl3(
+1398:            weight_q = preapply_had_l(weight_q, had_k)
+1400:            weight_q = preapply_had_r(weight_q, had_n)
+1449:def _get_stage_buf(device_index: int, slot: int, nbytes: int):
+1460:class _WeightStager:
+1468:    def __init__(self, device: torch.device):
+1474:    def prefetch(self, t: int, w: torch.Tensor):
+1496:    def get(self, t: int, w: torch.Tensor) -> torch.Tensor:
+1507:def quantize_exl3_batch(
+===

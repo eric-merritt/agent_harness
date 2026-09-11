@@ -157,7 +157,9 @@ impl std::fmt::Display for GgmlType {
 /// Parsed safetensors header (JSON at the top of the file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafeTensorsHeader {
+	#[serde(rename = "__metadata__", default)]
 	pub metadata: HashMap<String, String>,
+	#[serde(flatten)]
 	pub tensors: HashMap<String, SafeTensorInfo>,
 }
 
@@ -172,8 +174,9 @@ pub struct SafeTensorInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerType {
 	Attention,
-	Activation,
-	Weight,
+	Activation,   // Wide upward expansions (up_proj, gate_proj)
+	Contraction,  // Wide downward contractions (down_proj) - crucial for tile flipping
+	Weight,       // General weights/biases
 	OutputProj,
 	Norm,
 	Embedding,
@@ -185,6 +188,7 @@ impl std::fmt::Display for LayerType {
 		match self {
 			LayerType::Attention => write!(f, "attention"),
 			LayerType::Activation => write!(f, "activation"),
+			LayerType::Contraction => write!(f, "contraction"),
 			LayerType::Weight => write!(f, "weight"),
 			LayerType::OutputProj => write!(f, "output_projection"),
 			LayerType::Norm => write!(f, "normalization"),
@@ -194,12 +198,6 @@ impl std::fmt::Display for LayerType {
 	}
 }
 
-/// Return the dimension of a specific layer.
-pub fn get_layer_dim(header: &SafeTensorsHeader, layer_name: &str) -> Option<Vec<u64>> {
-	header.tensors.get(layer_name).map(|t| t.shape.clone())
-}
-
-/// Return the type of layer (attn, activation, weight, output_proj).
 pub fn get_layer_type(name: &str) -> LayerType {
 	let lower = name.to_lowercase();
 	if lower.contains("self_attn")
@@ -211,9 +209,12 @@ pub fn get_layer_type(name: &str) -> LayerType {
 	{
 		return LayerType::Attention;
 	}
+	// Explicitly catch the inverse down-projection first
+	if lower.contains("down_proj") {
+		return LayerType::Contraction;
+	}
 	if lower.contains("gate_proj")
 		|| lower.contains("up_proj")
-		|| lower.contains("down_proj")
 		|| lower.contains("mlp")
 	{
 		return LayerType::Activation;
@@ -232,6 +233,7 @@ pub fn get_layer_type(name: &str) -> LayerType {
 	}
 	LayerType::Unknown
 }
+
 
 // ---------------------------------------------------------------------------
 // GGUF

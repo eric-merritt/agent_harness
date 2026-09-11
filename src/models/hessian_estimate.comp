@@ -1,0 +1,202 @@
+#version 450
+//
+// Hessian sensitivity estimator — Vulkan 1.3 compute (Hutchinson's method).
+//
+// Estimates a per-tile directional error variance for the quantizer WITHOUT ever
+// materialising a dense Hessian and WITHOUT second-order autodiff. The identity we
+// exploit is that a Rademacher projection of the curvature can be recovered through
+// only GEMV-like work, run in two dispatches against the SAME two descriptor
+// bindings:
+//
+//     pass 0 : Xv = W·x̃          (x̃ = Rademacher-activated input), atomicAdd → scratch
+//     pass 1 : per-tile vᵀ(Xv)   → directional error variance plane (one f32 / tile)
+//
+// The output is one f32 per 32×32 weight tile — the input to the bit-rate map. High
+// value ⇒ this tile's weights move a lot in a sensitive direction ⇒ spend bits there;
+// low ⇒ quantise coarser. No dense matrix, no AD, ever.
+//
+// ── BINDINGS (mirror memory_controller::pingpong) ────────────────────────────
+//   binding 0 : one flat f32 arena, three regions back-to-back:
+//               [0 .. n_act)                          = read-only input activations x
+//               [n_act .. 2*n_act)                    = writable scratch (Xv), zeroed by host fill
+//               [2*n_act .. 2*n_act + n_tiles)        = variance plane (one f32 per tile)
+//   binding 1 : paged FP16 weight-tile region, row-major n_in×n_out f16.
+//
+// ── NO HOST UPLOAD FOR THE RANDOM VECTOR ──────────────────────────────────────
+// Every ±1 draw is generated in-shader from a hash seeded by push constants
+// (seed, layer_idx, pass). Stateless per lane — nothing crosses the bus.
+//
+// ── WARP SHAPE / REGISTER FILE ────────────────────────────────────────────────
+// local_size_x = 32, local_size_y = 4 : one Ada warp per row of the tile grid.
+// Weights are staged into shared memory at workgroup entry so the token loop reads
+// exclusively from registers — no global weight re-fetch per token.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(std430, binding = 0) buffer Activations {
+    float data[];
+};
+
+// FP16 weight tiles, row-major n_in×n_out. Addressed as f16 pairs per uint.
+layout(std430, binding = 1) buffer Weights {
+    uint wdata[];
+} wbuf;
+
+layout(push_constant) uniform Push {
+    uint pass;        // 0 = Xv accumulation, 1 = variance reduction
+    uint n_tokens;    // rows of the activation matrix (sequence length)
+    uint n_in;        // this layer's input width   (5120 attn / 5120 ffn-in)
+    uint n_out;       // this layer's output width  (5120 attn / 17408 ffn-up)
+    uint seed;        // base Philox seed
+    uint layer_idx;   // folded into the counter: fresh draws per layer, reproducible
+} pc;
+
+const uint TILE = 32u;
+
+// ── Shared memory: weight staging. ─────────────────────────────────────────────
+// Pass 0 (grid.x=out_col, y=in_row_slab): each lane loads ONE weight
+//   W[slab*32 + lane_x][out_col] into wcol[lane_y]. The 4 warps hold 4 different
+//   input rows; the token loop reads wcol[lane_y] from registers.
+// Pass 1 (grid.x=tile_col, y=tile_row): each lane loads ONE weight
+//   W[tile_col*32 + lane_x][tile_row*32 + lane_y] into wreg (scalar register).
+// Both passes fit in per-lane registers after a single shared-memory staging step.
+
+// Pass 0: column of 32 weights for this workgroup's out_col, one per input row in slab.
+// Lane (x, y) holds W[slab*32 + x][out_col] — but we only need the lane_x component
+// since each lane IS its own input row. So just a scalar per lane is enough.
+// Actually: pass 0 grid.x = out_col, grid.y = slab. Lane (x,y) has in_row = slab*32+x.
+// It needs W[in_row][out_col] — one weight. No shared memory needed at all for pass 0!
+// The "RF" is just a register: wreg = load_w(in_row, out_col).
+
+// For pass 1 we DO want the tile in shared so all 4 warps can read it cooperatively.
+shared float wt[32][32];
+
+// ── Stateless per-lane hash → Rademacher ±1. ─────────────────────────────────
+uint hash_u(uint x) {
+    x ^= x >> 16;
+    x *= 0x7F4A7C15u;
+    x ^= x >> 16;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// One Rademacher ±1 for element `i`, fresh per layer+pass.
+float rademacher(uint i) {
+    uint h = hash_u(i ^ (pc.layer_idx * 0x9E37u) ^ (pc.pass * 0x85EBu) ^ pc.seed);
+    return (h & 1u) == 0u ? 1.0 : -1.0;
+}
+
+// Read one f16 weight at linear index i from binding 1.
+float load_w_global(uint i) {
+    uint word = wbuf.wdata[i >> 1];
+    uint bits = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16);
+    return unpackHalf2x16(bits).x;
+}
+
+// Arena partition bases in ELEMENTS (see header):
+//   input:   [0, n_act)                          — read-only activations
+//   scratch: [n_act, n_act + n_out)              — Xv accumulator (one f32 per out col)
+//   plane:   [n_act + n_out, ...)                — variance plane (one f32 per tile)
+uint n_act()        { return pc.n_tokens * pc.n_in; }
+uint scratch_base() { return n_act(); }
+uint plane_base()   { return n_act() + pc.n_out; }
+
+// ── PASS 0 : Xv = W · x̃, accumulated with atomicAdd into the scratch half. ────
+// grid.x = output column, grid.y = input row slab of 32.
+// Each lane owns one input row (slab*32 + lane_x). It loads its weight into a
+// register (the RF), then sweeps all tokens: broadcast activation via the global
+// buffer (coalesced across the warp since all lanes read consecutive rows), sign
+// with Rademacher, multiply by the register-resident weight.
+void pass_accumulate() {
+    uint out_col = gl_WorkGroupID.x;
+    if (out_col >= pc.n_out) return;
+
+    uint in_row = gl_WorkGroupID.y * TILE + gl_LocalInvocationID.x;
+    if (in_row >= pc.n_in) return;
+
+    // RF: one weight per lane, loaded once before the token sweep.
+    float wreg = load_w_global(in_row * pc.n_out + out_col);
+
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.n_tokens; ++t) {
+        uint idx = t * pc.n_in + in_row;
+        // All 32 lanes read consecutive activation elements — fully coalesced.
+        float x_val = data[idx];
+        float xs = rademacher(idx) * x_val;
+        acc += wreg * xs;
+    }
+
+    // Fold the 32-lane slab across the warp, then atomicAdd this slab's share.
+    float s = acc;
+    for (uint m = 16u; m > 0u; m >>= 1) {
+        s += subgroupShuffleXor(s, m);
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        atomicAdd(data[scratch_base() + out_col], s);
+    }
+}
+
+// ── PASS 1 : per-tile directional error variance. ─────────────────────────────
+// One workgroup = one 32×32 weight tile (grid.x = tile col, grid.y = tile row).
+// The full tile is staged into shared memory at entry (cooperative load across all
+// 128 lanes). Each lane then reads its element from shared → register and does the
+// Rademacher-signed product against the scratch Xv value. Warp-shuffle fold, then
+// one atomicAdd per warp into the plane slot.
+void pass_variance() {
+    uint tile_col = gl_WorkGroupID.x;
+    uint tile_row = gl_WorkGroupID.y;
+
+    uint in_el  = tile_col * TILE + gl_LocalInvocationID.x;
+    uint out_el = tile_row * TILE + gl_LocalInvocationID.y;
+
+    if (in_el >= pc.n_in || out_el >= pc.n_out) return;
+
+    // Weight from shared memory (staged cooperatively at entry — no global re-fetch).
+    float wreg = wt[gl_LocalInvocationID.x][gl_LocalInvocationID.y];
+    float xv   = data[scratch_base() + in_el];
+    float prod = wreg * (rademacher(in_el) * xv);
+
+    // Warp-shuffle fold across the 32 lanes of this warp.
+    float e = prod;
+    for (uint m = 16u; m > 0u; m >>= 1) {
+        e += subgroupShuffleXor(e, m);
+    }
+
+    if (gl_LocalInvocationID.x == 0u) {
+        uint n_tiles_x = pc.n_in / TILE;
+        uint tile_id = tile_row * n_tiles_x + tile_col;
+        atomicAdd(data[plane_base() + tile_id], e * e);
+    }
+}
+
+void main() {
+    if (pc.pass == 1u) {
+        // Stage the full 32×32 tile into shared memory cooperatively.
+        // Lane (x, y) loads W[tile_col*32 + x][tile_row*32 + y].
+        uint tile_col = gl_WorkGroupID.x;
+        uint tile_row = gl_WorkGroupID.y;
+        uint in_el  = tile_col * TILE + gl_LocalInvocationID.x;
+        uint out_el = tile_row * TILE + gl_LocalInvocationID.y;
+
+        if (in_el < pc.n_in && out_el < pc.n_out) {
+            wt[gl_LocalInvocationID.x][gl_LocalInvocationID.y] =
+                load_w_global(in_el * pc.n_out + out_el);
+        } else {
+            wt[gl_LocalInvocationID.x][gl_LocalInvocationID.y] = 0.0;
+        }
+
+        barrier();
+
+        pass_variance();
+    } else {
+        // Pass 0: each lane loads its own weight into a register (the RF).
+        // No shared memory needed — one scalar per lane, loop-invariant.
+        pass_accumulate();
+    }
+}

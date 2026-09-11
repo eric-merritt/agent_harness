@@ -1,0 +1,25 @@
+**Role & Operational Boundaries:**  
+You are a low-level systems AI engineer specializing in high-performance Vulkan compute architectures. Your task is to design a state-of-the-art **mixed-precision quantization pipeline** targeting an  **RTX 4080 Super (Ada Lovelace architecture)**.  
+**Strict Context Constraint:**  
+You are **strictly prohibited** from reading or modifying any files outside of the memory_controller module. Your previous subagents exceeded their context bounds; you must operate entirely within this module. It contains all host-side memory management logic necessary to implement the specifications below. Ignore all legacy file formats, as this system entirely redefines the model weight distribution format.  
+**Task 1: Dual-Binding Sequential Memory Architecture with FFN Expansion Handlers**  
+Implement a host-side allocation and descriptor layout structure within the memory_controller that manages exactly **two descriptor bindings** across an alternating execution loop. Do not hardcode parameters; expose them dynamically via push constants or uniforms using mathematical formulas that handle both square Attention layers and wide, non-square FFN expansion layers.  
+1. **binding = 0** ** (The Ping-Pong Activation Space):**  
+A descriptor binding whose underlying physical buffer swaps roles layer-by-layer using two identical, pre-allocated memory blocks (**Buffer A** and  **Buffer B**).  
+- **Role 1 (Read-Only Input Activations):** Points to the input features of the active layer. Size formula: Sequence Length (Tokens) × Hidden Dimension (nDim) × 4 bytes (FP32). For a 5,120-wide hidden dimension at 4,096 tokens, this resolves to exactly  **83,886,080** ** bytes (80.00 MiB)**.  
+- **Role 2 (Writable Global Scratch Accumulator):** Points to the alternating buffer, cleared to zero via vkCmdFillBuffer at the start of a layer pass. Compute shaders write their partial row outputs directly into this space using atomic additions (atomicAdd). At the end of the layer execution pass, a VkBufferMemoryBarrier enforces a Read-After-Write (RAW) choke point, transforming this scratch buffer into the clean input vector for the next layer.  
+2. **binding = 1** ** (Paged Sparse Weight Tile Space with FFN Support):  
+ **A dedicated, Read-Only memory descriptor mapping your model parameters paged dynamically via a Vulkan sparse buffer layout. Weights must be laid out in a continuous linear fashion, completely separate from activation spaces to maintain cache alignment. Weights are stored as  **32 × 32 element tiles** in  **FP16** precision.  
+   
+- **Sizing Formula:** Input Dimension (nDim_in) × Output Dimension (nDim_out) × 2 bytes (FP16).  
+- **Attention Layer Size Configuration:** For a standard square layer (5120 × 5120), this resolves to exactly  **52,428,800** ** bytes (50.00 MiB)**, composed of a grid of exactly 25,600 individual 2 KB tiles (160 horizontal × 160 vertical).  
+- **FFN Layer Size Configuration (SwiGLU Expansion):** To handle Qwen's non-square SwiGLU gated network layers (ffn_up and ffn_gate), the allocator must scale to accommodate the \(\frac{8}{3}\) hidden dimension expansion factor. For a 5,120-wide baseline model, the intermediate dimension scales to 17,408. The allocation size for an FFN tensor page becomes: 5,120 × 17,408 × 2 bytes, resolving to exactly  **178,257,920** ** bytes (170.00 MiB)**, composed of a grid of 87,040 individual 2 KB tiles (160 horizontal × 544 vertical). Both dimensions remain perfectly divisible by 32.  
+**Task 2: Randomized Empirical Hessian Estimation (Hutchinson's Estimator)**  
+Design the compute pipeline and mathematical logic to estimate layer-wise Hessian sensitivity profiles without materializing dense matrices or computing second-order automatic differentiation loops.  
+- **On-the-Fly Rademacher Projections:  
+ **Instead of uploading random tensors from the host, the GLSL compute shaders must generate random +1 and -1 vector bits on the fly in local registers using a lightweight hardware-friendly pseudo-random number generator (PRNG) like PCG or Philox, seeded via push constants.  
+- **Hardware Coalescing & Shuffle Operations:  
+ **Configure your workgroup footprint to exploit the 32-thread hardware warp size of the 4080 Super (local_size_x = 32, local_size_y = 4). Implement the matrix-vector sensitivity loops using horizontal warp shuffles (subgroupShuffle). Threads must load a single activation element from binding = 0, broadcast it across the warp registers in a single clock cycle, and execute the sign-flip operations against the 32 × 32 tile parameters loaded into the Vector Register File (RF).  
+- **Trellis / Mixed-Precision Search Interface:  
+ **The output of these random matrix-vector products (\(H v = X^T(Xv)\)) must be mapped directly to a localized Trellis quantization search loop. The system must evaluate directional error variance across the 32 × 32 tiles to dynamically allocate lower bit-rates to insensitive paths while preserving high-precision weights along paths where the random projections detect sharp error gradients.  
+   
