@@ -1,0 +1,128 @@
+#version 450
+//
+// Tile energy measurer — Vulkan 1.3 compute (single dispatch, no atomics).
+//
+// Feeds the dynamic bit-rate quantizer: for every 32×32 weight tile it reports how much
+// of the Rademacher-activated input energy lands on that tile's output columns. That is
+// exactly the per-tile squared norm ‖Xv‖² = Σ_o Xv[o]² restricted to the tile's rows —
+// the quantity a quantizer needs to decide how many bits the tile can afford to spend.
+//
+// The Rademacher draws are IDENTICAL to hessian_estimate.comp (same hash, same seed,
+// pass-independent), so this measures the SAME activated direction the Hessian estimator
+// projects onto — nothing crosses the bus, every ±1 is regenerated in-shader from the
+// push-constant seed.
+//
+// ── BINDINGS (mirror hessian_estimate) ────────────────────────────────────────
+//   binding 0 : one flat f32 arena:
+//               [0 .. n_act)                    = read-only input activations x
+//               [n_act .. n_act + n_tiles)      = per-tile energy output (one f32 / tile)
+//   binding 1 : paged FP16 weight-tile region, row-major n_in×n_out f16.
+//
+// ── GRID ───────────────────────────────────────────────────────────────────────
+// One workgroup = one tile (grid.x = tile col, grid.y = tile row). local_size 32×4 =
+// 128 lanes. Lane (x,y) owns input column x and output rows y*8..y*8+7: it sweeps all
+// tokens to build its partial Xv[o] for those 8 columns, squares them, warp-folds the
+// x-dim, then folds the 4 warps through shared memory into a single store. No atomics —
+// each tile writes exactly one f32, so there is nothing to race.
+
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 32, local_size_y = 4) in;
+
+layout(std430, binding = 0) buffer Arena {
+    float data[];
+};
+
+// FP16 weight tiles, row-major n_in×n_out. Addressed as f16 pairs per uint.
+layout(std430, binding = 1) buffer Weights {
+    uint wdata[];
+} wbuf;
+
+layout(push_constant) uniform Push {
+    uint n_tokens;   // rows of the activation matrix (sequence length)
+    uint n_in;       // this layer's input width
+    uint n_out;      // this layer's output width
+    uint seed;       // base Philox seed — MUST match hessian_estimate for the same draws
+    uint layer_idx;  // folded into the counter: fresh draws per layer, reproducible
+} pc;
+
+const uint TILE = 32u;
+
+// Per-warp scratch to fold the 4 warp-sums (y-dim) into one store.
+shared float wg_acc[4];
+
+// ── Stateless per-lane hash → Rademacher ±1. MUST match hessian_estimate.comp. ──
+uint hash_u(uint x) {
+    x ^= x >> 16;
+    x *= 0x7F4A7C15u;
+    x ^= x >> 16;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// One Rademacher ±1 for element `i`, fresh per layer, pass-independent — the SAME draw
+// hessian_estimate uses, so this measures the direction the estimator projects onto.
+float rademacher(uint i) {
+    uint h = hash_u(i ^ (pc.layer_idx * 0x9E37u) ^ pc.seed);
+    return (h & 1u) == 0u ? 1.0 : -1.0;
+}
+
+// Read one f16 weight at linear index i from binding 1.
+float load_w_global(uint i) {
+    uint word = wbuf.wdata[i >> 1];
+    uint bits = (i & 1u) == 0u ? (word & 0xFFFFu) : (word >> 16);
+    return unpackHalf2x16(bits).x;
+}
+
+uint n_act()      { return pc.n_tokens * pc.n_in; }
+uint plane_base() { return n_act(); }   // energy output starts right after the activations
+
+void main() {
+    uint tile_col = gl_WorkGroupID.x;
+    uint tile_row = gl_WorkGroupID.y + gl_WorkGroupID.z * 256u;
+    uint n_tiles_x = pc.n_in / TILE;
+    uint tile_id   = tile_row * n_tiles_x + tile_col;
+
+    // Lane (x,y): input column in_el, output rows out_el = y*8 .. y*8+7.
+    uint in_el  = tile_col * TILE + gl_LocalInvocationID.x;
+    uint base_o = tile_row * TILE + gl_LocalInvocationID.y * 8u;
+
+    // Build the partial Xv[o] for this lane's 8 output columns:
+    //   Xv[o] = Σ_i W[i,o] · (Σ_t act[t,i]·rad(t·n_in+i))
+    // The weight W[in_el,o] is constant over the token sweep — hoist it per column.
+    float xv[8];
+    for (uint r = 0u; r < 8u; ++r) {
+        uint o = base_o + r;
+        if (in_el >= pc.n_in || o >= pc.n_out) { xv[r] = 0.0; continue; }
+        float wreg = load_w_global(in_el * pc.n_out + o);
+        float acc = 0.0;
+        for (uint t = 0u; t < pc.n_tokens; ++t) {
+            uint idx = t * pc.n_in + in_el;
+            // All 32 lanes read consecutive activation elements — fully coalesced.
+            float x_val = data[idx];
+            acc += rademacher(idx) * x_val;
+        }
+        xv[r] = wreg * acc;
+    }
+
+    // Per-tile energy: Σ_o Xv[o]² over this lane's 8 columns, then fold the warp (x-dim).
+    float e = 0.0;
+    for (uint r = 0u; r < 8u; ++r) {
+        e += xv[r] * xv[r];
+    }
+    for (uint m = 16u; m > 0u; m >>= 1) {
+        e += subgroupShuffleXor(e, m);
+    }
+
+    // Fold the 4 warps (y-dim) through shared memory, then ONE store per tile.
+    if (gl_LocalInvocationID.x == 0u) {
+        wg_acc[gl_LocalInvocationID.y] = e;
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == 0u) {
+        data[plane_base() + tile_id] = wg_acc[0] + wg_acc[1] + wg_acc[2] + wg_acc[3];
+    }
+}

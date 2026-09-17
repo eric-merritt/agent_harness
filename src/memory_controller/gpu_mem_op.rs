@@ -68,6 +68,10 @@ pub fn init_gpu() -> Result<
 				_ => "other",
 			}
 		);
+		eprintln!(
+			"[GPU INIT] limits: maxComputeWorkGroupInvocations={}",
+			props.limits.max_compute_work_group_invocations
+		);
 	}
 
 	// ── Get a compute-capable queue ──
@@ -89,6 +93,34 @@ pub fn init_gpu() -> Result<
 	let enabled_features = vk::PhysicalDeviceFeatures::default()
 		.sparse_binding(true)
 		.sparse_residency_buffer(true);
+
+	// The controller's VirtualTensorArena reserves (cpu_free + vram - 4GB) of virtual
+	// address space in one sparse buffer. On a machine with lots of free RAM that is
+	// hundreds of GB — far beyond any driver's maxBufferDeviceAddress / max allocation,
+	// so the arena creation fails and every GpuOnly allocation after it OOMs. Cap the
+	// reservation at 8 GiB: plenty for this workload (a few hundred MB of buffers),
+	// small enough to fit in any driver's address space.
+	const MAX_ARENA_RESERVATION: u64 = 8 * 1024 * 1024 * 1024;
+	let sys = {
+		let mut s = sysinfo::System::new_all();
+		s.refresh_memory();
+		s
+	};
+	let cpu_bytes = sys.available_memory();
+	let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+	let vram_bytes = (0..mem_props.memory_heap_count as usize)
+		.filter(|&i| mem_props.memory_heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+		.map(|i| mem_props.memory_heaps[i].size)
+		.max()
+		.unwrap_or(0);
+	let reserved = 4_000_000_000u64;
+	let total_addressable = (cpu_bytes + vram_bytes).saturating_sub(reserved).min(MAX_ARENA_RESERVATION);
+	unsafe { std::env::set_var("AGENT_HARNESS_ARENA_BYTES", total_addressable.to_string()) };
+	eprintln!(
+		"[GPU INIT] arena reservation: cpu={}B vram={}B → capping at {}B (max {}B)",
+		cpu_bytes, vram_bytes, total_addressable, MAX_ARENA_RESERVATION
+	);
+
 	let queue_family_list = [queue_family];
 	let device_create_info = vk::DeviceCreateInfo::default()
 		.queue_create_infos(&queue_family_list)

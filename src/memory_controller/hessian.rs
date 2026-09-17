@@ -274,7 +274,13 @@ pub unsafe fn dispatch_hessian(
 		// Pass 1: per-tile directional variance → plane. grid.x = tile col, grid.y = tile row.
 		let pc1 = HessianPushConstants { pass: 1, n_tokens, n_in, n_out, seed, layer_idx };
 		push_pc(device, cmd, pipeline.layout, &pc1);
-		device.cmd_dispatch(cmd, n_in / 32, n_out / 32, 1);
+		// The shader's workgroup is 32×4 = 128 lanes; the driver caps grid.y at
+		// maxComputeWorkGroupCount / local_size_y (1024/4 = 256 on Ada). n_out/32 can be
+		// 544 for a 17408-wide FFN, so split the tile rows across z.
+		let tiles_y = n_out / 32;
+		let max_grid_y = 256u32; // conservative: min driver limit / local_size_y
+		let grid_z = (tiles_y + max_grid_y - 1) / max_grid_y;
+		device.cmd_dispatch(cmd, n_in / 32, tiles_y.min(max_grid_y), grid_z);
 
 		device.end_command_buffer(cmd).map_err(|e| format!("end cmd: {e:?}"))?;
 	}
@@ -344,24 +350,27 @@ pub fn trellis_bit_assignment(
 		return Vec::new();
 	}
 
-	// Total bit pool for this layer's tile grid (each tile has TILE*TILE elements).
-	const TILES_ELEMS: f64 = 32.0 * 32.0;
-	let target_total_bits = budget_bits_per_elem * n as f64 * TILES_ELEMS;
+	// Work in bits directly: budget_bits_per_elem × (elements per tile) × tiles.
+	// One promotion spends exactly ONE bit — the K rate is already bits-per-element, so
+	// multiplying by TILES_ELEMS here would double-count and starve every promotion.
+	let target_total_bits = budget_bits_per_elem * n as f64;
 
 	// Rank tiles by variance descending — spend bits where the Hessian projection is sharp.
 	let mut order: Vec<usize> = (0..n).collect();
 	order.sort_by(|&a, &b| variance[b].partial_cmp(&variance[a]).unwrap_or(std::cmp::Ordering::Equal));
 
 	let mut k = vec![min_bits; n];
-	// Start every tile at min_bits, then walk the ranking handing out +1 until the budget is met.
-	let mut remaining = target_total_bits - (min_bits as f64) * n as f64 * TILES_ELEMS;
+	// Start every tile at min_bits, then walk the ranking handing out +1 to each tile
+	// (as many as possible, up to max_bits) until the budget is met.
+	let mut remaining = target_total_bits - (min_bits as f64) * n as f64; // bits left to spend above the min-rate floor
+
 	for &idx in order.iter() {
+		while remaining > 0.0 && k[idx] < max_bits {
+			k[idx] += 1;
+			remaining -= 1.0; // one more bit/element across this tile's 1024 elems
+		}
 		if remaining <= 0.0 {
 			break;
-		}
-		if k[idx] < max_bits {
-			k[idx] += 1;
-			remaining -= TILES_ELEMS; // one more bit/element across this tile's 1024 elems
 		}
 	}
 
@@ -458,12 +467,10 @@ pub unsafe fn dispatch_trellis_encode(
 		device.end_command_buffer(cmd).map_err(|e| format!("end cmd: {e:?}"))?;
 	}
 
-	// ── Submit once. ───────────────────────────────────────────────────────────────
-	// Non-blocking: the fence is recorded so a future timeline-semaphore / async queue can
-	// signal on it, but we do NOT wait here. The caller owns completion — either by
-	// polling the fence out-of-band or by chaining a timeline semaphore before the next
-	// consumer of `weight_region`. This keeps the buffer-encoding stream untouched so the
-	// blocking sync can be swapped for an async model without rewriting it.
+	// ── Submit once and wait for completion. ───────────────────────────────────────
+	// The fence MUST be waited on before the command buffer is recycled below: recycling a
+	// command buffer (or its fence) while its dispatch is still in flight corrupts the
+	// queue and trips Xid 109 (CTX SWITCH TIMEOUT) → ERROR_DEVICE_LOST on the next sync.
 	let fence = GpuContext::alloc_fence(device, fence_pool);
 	unsafe {
 		device
@@ -473,15 +480,12 @@ pub unsafe fn dispatch_trellis_encode(
 				fence,
 			)
 			.map_err(|e| format!("submit trellis: {e:?}"))?;
-		// Blocking wait — commented out so this function returns as soon as the submit is
-		// enqueued. The whole sync point is isolated to these lines so it can be replaced
-		// by a timeline-semaphore signal without touching the encode stream above.
-		// device
-		// 	.wait_for_fences(&[fence], true, u64::MAX)
-		// 	.map_err(|e| format!("wait trellis fence: {e:?}"))?;
+		device
+			.wait_for_fences(&[fence], true, u64::MAX)
+			.map_err(|e| format!("wait trellis fence: {e:?}"))?;
 	}
 
-	// Restore binding 0 to the activation arena now that this dispatch is enqueued — the
+	// Restore binding 0 to the activation arena now that this dispatch has completed — the
 	// scratch alias must not leak into the next consumer of the pipeline's cached set.
 	let act_info = vk::DescriptorBufferInfo::default()
 		.buffer(act_buffer)
@@ -689,6 +693,279 @@ impl TrellisPipeline {
 	}
 }
 
+/// Push constants for the tile-energy measurer. Field order MUST match the shader's `Push`
+/// block exactly (n_tokens, n_in, n_out, seed, layer_idx) — same Rademacher draws as the
+/// Hessian estimator so the measured energy is on the same activated direction.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MeasurePushConstants {
+	pub n_tokens: u32,
+	pub n_in: u32,
+	pub n_out: u32,
+	pub seed: u32,
+	pub layer_idx: u32,
+}
+
+unsafe fn push_measure_pc(
+	device: &ash::Device,
+	cmd: vk::CommandBuffer,
+	layout: vk::PipelineLayout,
+	pc: &MeasurePushConstants,
+) {
+	let bytes = unsafe {
+		std::slice::from_raw_parts(pc as *const _ as *const u8, std::mem::size_of::<MeasurePushConstants>())
+	};
+	unsafe { device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, bytes) };
+}
+
+/// The compiled tile-energy measurer pipeline + its immutable descriptor set.
+pub struct QuantPipeline {
+	pub pipeline: vk::Pipeline,
+	pub layout: vk::PipelineLayout,
+	pub set_layout: vk::DescriptorSetLayout,
+	pub pool: vk::DescriptorPool,
+	pub set: vk::DescriptorSet,
+}
+
+impl QuantPipeline {
+	/// Build the two-binding compute pipeline for `tile_measure.spv`.
+	///
+	/// * `act_buffer` — the activation arena (input activations + energy output in one buffer).
+	/// * `weight_region` — the paged FP16 weight-tile region.
+	pub unsafe fn create(
+		device: &ash::Device,
+		spirv: &[u8],
+		act_buffer: vk::Buffer,
+		weight_region: vk::Buffer,
+	) -> Result<Self, String> {
+		let bindings = [
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(0)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(1)
+				.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+		];
+
+		let set_layout = unsafe {
+			device
+				.create_descriptor_set_layout(
+					&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+					None,
+				)
+				.map_err(|e| format!("measure dsl: {e:?}"))?
+		};
+
+		let push_range = vk::PushConstantRange::default()
+			.stage_flags(vk::ShaderStageFlags::COMPUTE)
+			.offset(0)
+			.size(std::mem::size_of::<MeasurePushConstants>() as u32);
+
+		let layout = unsafe {
+			device
+				.create_pipeline_layout(
+					&vk::PipelineLayoutCreateInfo::default()
+						.set_layouts(std::slice::from_ref(&set_layout))
+						.push_constant_ranges(std::slice::from_ref(&push_range)),
+					None,
+				)
+				.map_err(|e| format!("measure layout: {e:?}"))?
+		};
+
+		let pool_size = vk::DescriptorPoolSize::default()
+			.ty(vk::DescriptorType::STORAGE_BUFFER)
+			.descriptor_count(2);
+		let pool = unsafe {
+			device
+				.create_descriptor_pool(
+					&vk::DescriptorPoolCreateInfo::default()
+						.max_sets(1)
+						.pool_sizes(std::slice::from_ref(&pool_size)),
+					None,
+				)
+				.map_err(|e| format!("measure pool: {e:?}"))?
+		};
+
+		let set = unsafe {
+			device
+				.allocate_descriptor_sets(
+					&vk::DescriptorSetAllocateInfo::default()
+						.descriptor_pool(pool)
+						.set_layouts(std::slice::from_ref(&set_layout)),
+				)
+				.map_err(|e| format!("measure alloc set: {e:?}"))?[0]
+		};
+
+		let act_info = vk::DescriptorBufferInfo::default()
+			.buffer(act_buffer)
+			.offset(0)
+			.range(vk::WHOLE_SIZE);
+		let wgt_info = vk::DescriptorBufferInfo::default()
+			.buffer(weight_region)
+			.offset(0)
+			.range(vk::WHOLE_SIZE);
+
+		unsafe {
+			device.update_descriptor_sets(
+				&[
+					vk::WriteDescriptorSet::default()
+						.dst_set(set)
+						.dst_binding(0)
+						.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+						.buffer_info(std::slice::from_ref(&act_info)),
+					vk::WriteDescriptorSet::default()
+						.dst_set(set)
+						.dst_binding(1)
+						.descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+						.buffer_info(std::slice::from_ref(&wgt_info)),
+				],
+				&[],
+			);
+		}
+
+		let words: Vec<u32> = spirv
+			.chunks_exact(4)
+			.map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+			.collect();
+
+		let entry_name = c"main";
+		let shader_module = unsafe {
+			device
+				.create_shader_module(
+					&vk::ShaderModuleCreateInfo::default().code(&words),
+					None,
+				)
+				.map_err(|e| format!("measure spirv: {e:?}"))?
+		};
+		let stage = vk::PipelineShaderStageCreateInfo::default()
+			.stage(vk::ShaderStageFlags::COMPUTE)
+			.module(shader_module)
+			.name(entry_name);
+
+		let pipeline_result = unsafe {
+			device.create_compute_pipelines(
+				vk::PipelineCache::null(),
+				&[vk::ComputePipelineCreateInfo::default()
+					.stage(stage)
+					.layout(layout)],
+				None,
+			)
+		};
+
+		match pipeline_result {
+			Ok(pipelines) => {
+				let pipeline = pipelines[0];
+				unsafe { device.destroy_shader_module(shader_module, None); }
+				Ok(QuantPipeline {
+					pipeline,
+					layout,
+					set_layout,
+					pool,
+					set,
+				})
+			}
+			Err(e) => {
+				unsafe {
+					device.destroy_shader_module(shader_module, None);
+					device.destroy_descriptor_pool(pool, None);
+					device.destroy_pipeline_layout(layout, None);
+					device.destroy_descriptor_set_layout(set_layout, None);
+				}
+				Err(format!("measure pipeline: {e:?}"))
+			}
+		}
+	}
+}
+
+/// Run the tile-energy measurer for one layer and return the per-tile ‖Xv‖² values.
+///
+/// `act_buffer` must hold the input activations in `[0, n_tokens*n_in)` and have room for
+/// `n_tiles` f32s at offset `n_tokens*n_in*4`. The energy output is written there by the
+/// shader; we download it and return one f32 per 32×32 tile.
+pub unsafe fn dispatch_measure(
+	ctx: &super::controller::GpuContext,
+	pipeline: &QuantPipeline,
+	act_buffer: vk::Buffer,
+	weight_region: vk::Buffer,
+	n_tokens: u32,
+	n_in: u32,
+	n_out: u32,
+	layer_idx: u32,
+	seed: u32,
+) -> Result<Vec<f32>, String> {
+	use super::controller::GpuContext;
+
+	let device = &ctx.device_handle;
+	let queue = ctx.queue_handle;
+	let command_pool = ctx.command_pool;
+	let cmd_buffer_pool = &ctx.cmd_buffer_pool;
+	let fence_pool = &ctx.fence_pool;
+
+	let n_act_elems = n_tokens as u64 * n_in as u64;
+	let n_tiles = (n_in / 32) as u64 * (n_out / 32) as u64;
+	let plane_off = n_act_elems * 4; // energy output starts right after the activations
+
+	let cmd = GpuContext::alloc_cmd_buffer(device, command_pool, cmd_buffer_pool);
+	unsafe {
+		device
+			.begin_command_buffer(
+				cmd,
+				&vk::CommandBufferBeginInfo::default()
+					.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+			)
+			.map_err(|e| format!("begin cmd: {e:?}"))?;
+
+		device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+		device.cmd_bind_descriptor_sets(
+			cmd,
+			vk::PipelineBindPoint::COMPUTE,
+			pipeline.layout,
+			0,
+			&[pipeline.set],
+			&[],
+		);
+
+		let pc = MeasurePushConstants { n_tokens, n_in, n_out, seed, layer_idx };
+		push_measure_pc(device, cmd, pipeline.layout, &pc);
+
+		// One workgroup per tile. grid.x = tile col, grid.y/z split the tile rows (the
+		// driver caps grid.y at maxComputeWorkGroupCount / local_size_y).
+		let tiles_x = n_in / 32;
+		let tiles_y = n_out / 32;
+		let max_grid_y = 256u32;
+		let grid_z = (tiles_y + max_grid_y - 1) / max_grid_y;
+		device.cmd_dispatch(cmd, tiles_x, tiles_y.min(max_grid_y), grid_z);
+
+		device.end_command_buffer(cmd).map_err(|e| format!("end cmd: {e:?}"))?;
+	}
+
+	let fence = GpuContext::alloc_fence(device, fence_pool);
+	unsafe {
+		device
+			.queue_submit(
+				queue,
+				&[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))],
+				fence,
+			)
+			.map_err(|e| format!("submit measure: {e:?}"))?;
+		device
+			.wait_for_fences(&[fence], true, u64::MAX)
+			.map_err(|e| format!("wait measure fence: {e:?}"))?;
+	}
+	GpuContext::recycle_fence(device, fence, fence_pool);
+	GpuContext::recycle_cmd_buffer(device, cmd, cmd_buffer_pool);
+
+	let bytes = unsafe { ctx.download(act_buffer, plane_off, n_tiles * 4) };
+	Ok(bytes
+		.chunks_exact(4)
+		.map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+		.collect::<Vec<f32>>())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -765,7 +1042,7 @@ fn mul1_decode_cpu(i: u32) -> f32 {
 		} else if exp == 0x1F {
 			(sign << 31) | (0xFF << 23) | (mant << 13) // inf/nan
 		} else {
-			let e32 = exp as u32 - 15 + 127;
+			let e32 = (exp as i32 - 15 + 127) as u32;
 			(sign << 31)| (e32 << 23)|(mant << 13)
 		}
 		
@@ -792,7 +1069,7 @@ fn mul1_decode_cpu(i: u32) -> f32 {
 		let k = 4u32;
 		let n_states = 1024u32;
 		let states: Vec<u32> = (0..n_states).map(|i| (i * 7919) & 0xFF).collect();
-		let mask = (1u << k) - 1;
+		let mask = (0x1u32 << k) - 1;
 
 		// Pack little-endian, K bits per state.
 		let mut bits = 0u32;
@@ -802,12 +1079,12 @@ fn mul1_decode_cpu(i: u32) -> f32 {
 			let kb = s & mask;
 			for b in 0..k {
 				if (kb >> b) & 1 == 1 {
-					bits |= 1u << written;
+					bits |= 0x1u32 << written;
 				}
 				written += 1;
 				if written >= 32 {
 					words.push(bits);
-					bits >>= 32;
+					bits = 0; // full word flushed — start fresh (shifting a u32 by 32 overflows)
 					written -= 32;
 				}
 			}

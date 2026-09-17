@@ -236,6 +236,293 @@ pub fn get_layer_type(name: &str) -> LayerType {
 
 
 // ---------------------------------------------------------------------------
+// Model — full safetensors-directory loader (index + every shard header)
+// ---------------------------------------------------------------------------
+/// One tensor's metadata, fully resolved: the offset is ABSOLUTE within the
+/// shard file (8-byte length prefix + header JSON already added), so callers
+/// can `seek(SeekFrom::Start(offset))` and read `len` bytes directly.
+#[derive(Debug, Clone)]
+pub struct TensorMeta {
+	pub name: String,
+	pub dtype: String,
+	pub shape: Vec<u64>,
+	/// Absolute byte offset of this tensor's payload within its shard file.
+	pub offset: u64,
+	/// Byte length of the payload (end - start from the header).
+	pub len: u64,
+	/// Shard filename (relative to the model directory).
+	pub shard: String,
+}
+
+impl TensorMeta {
+	/// Element count = product(shape). 1 for a scalar tensor.
+	pub fn elem_count(&self) -> u64 {
+		self.shape.iter().copied().product()
+	}
+
+	/// `true` if this is a dense projection weight (q/k/v/up/down/gate proj).
+	pub fn is_projection_weight(&self) -> bool {
+		let lower = self.name.to_lowercase();
+		(lower.contains("proj.weight") || lower.ends_with(".weight"))
+			&& self.shape.len() == 2
+	}
+
+	/// (rows, cols) for a 2-D tensor, or None.
+	pub fn dims(&self) -> Option<(u64, u64)> {
+		if self.shape.len() == 2 {
+			Some((self.shape[0], self.shape[1]))
+		} else {
+			None
+		}
+	}
+
+	/// Read this tensor's raw payload bytes from disk.
+	pub fn read_bytes(&self, model_dir: &std::path::Path) -> Result<Vec<u8>, String> {
+		let path = model_dir.join(&self.shard);
+		let mut f = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+		use std::io::{Read, Seek};
+		f.seek(std::io::SeekFrom::Start(self.offset))
+			.map_err(|e| format!("seek {} @{}: {e}", self.name, self.offset))?;
+		let mut buf = vec![0u8; self.len as usize];
+		f.read_exact(&mut buf).map_err(|e| format!("read {}: {e}", self.name))?;
+		Ok(buf)
+	}
+
+	/// Read this tensor as f32 values. Supports F16 and BF16 (the two dtypes
+	/// real checkpoints ship in); anything else is a hard error, not a guess.
+	pub fn read_f32(&self, model_dir: &std::path::Path) -> Result<Vec<f32>, String> {
+		let raw = self.read_bytes(model_dir)?;
+		match self.dtype.as_str() {
+			"BF16" => Ok(raw
+				.chunks_exact(2)
+				// BF16 is the upper 16 bits of an f32: shift left by 16.
+				.map(|p| f32::from_bits(u32::from_le_bytes([0, 0, p[0], p[1]])))
+				.collect()),
+			"F16" => {
+				let mut out = Vec::with_capacity(raw.len() / 2);
+				for p in raw.chunks_exact(2) {
+					out.push(half::f16::from_le_bytes([p[0], p[1]]).to_f32());
+				}
+				Ok(out)
+			}
+			other => Err(format!(
+				"{}: dtype {} not supported by read_f32 (need F16/BF16)",
+				self.name, other
+			)),
+		}
+	}
+}
+
+/// A fully-loaded safetensors model directory: the index plus every shard's
+/// header, in memory. Query tensors directly — `model.tensor("...")` — no file
+/// I/O until you ask for payload bytes.
+#[derive(Debug)]
+pub struct Model {
+	pub dir: std::path::PathBuf,
+	/// tensor_name → metadata (absolute offsets).
+	pub tensors: HashMap<String, TensorMeta>,
+	/// shard filename → absolute byte offset where its data section starts
+	/// (8 + header_len). Kept so callers can verify offsets without re-parsing.
+	pub shard_data_starts: HashMap<String, u64>,
+}
+
+impl Model {
+	/// Load the full metadata of a safetensors model directory into memory.
+	///
+	/// Reads `model.safetensors.index.json` (or a single-shard
+	/// `model.safetensors` if there is no index), then every referenced shard's
+	/// header. Every step logs to stderr so a silent 0-fill can be chased down:
+	/// you will see the tensor count, each shard's data-section start, and the
+	/// resolved absolute offset of every tensor.
+	pub fn load(model_dir: &std::path::Path) -> Result<Self, String> {
+		let index_path = model_dir.join("model.safetensors.index.json");
+		let single_path = model_dir.join("model.safetensors");
+
+		let mut tensors: HashMap<String, TensorMeta> = HashMap::new();
+		let mut shard_data_starts: HashMap<String, u64> = HashMap::new();
+
+		if index_path.exists() {
+			// ── multi-shard: index → per-shard headers ────────────────────────
+			let data = std::fs::read_to_string(&index_path)
+				.map_err(|e| format!("read {}: {e}", index_path.display()))?;
+			eprintln!("[model] index: {} bytes", data.len());
+
+			#[derive(serde::Deserialize)]
+			struct IndexJson {
+				weight_map: HashMap<String, String>,
+			}
+			let idx: IndexJson = serde_json::from_str(&data)
+				.map_err(|e| format!("index JSON parse: {e}"))?;
+			eprintln!("[model] index lists {} tensors across shards", idx.weight_map.len());
+
+			// Group tensor names by shard so each header is parsed once.
+			let mut by_shard: HashMap<String, Vec<&String>> = HashMap::new();
+			for name in idx.weight_map.keys() {
+				by_shard.entry(idx.weight_map[name].clone()).or_default().push(name);
+			}
+
+			for (shard_name, names) in &by_shard {
+				let shard_path = model_dir.join(shard_name);
+				if !shard_path.exists() {
+					return Err(format!("missing shard {}", shard_path.display()));
+				}
+				let (header_len, data_start, header_tensors) = parse_safetensors_header(&shard_path)?;
+				eprintln!(
+					"[model]   shard {}: header_len={} data_start={} tensors={}",
+					shard_name, header_len, data_start, header_tensors.len()
+				);
+				shard_data_starts.insert(shard_name.clone(), data_start);
+
+				for name in names {
+					let info = header_tensors.get(*name)
+						.ok_or_else(|| format!("{name} not in shard {shard_name}"))?;
+					let (start, end) = info.data_offsets;
+					if end <= start || start + data_start > u64::MAX - 8 {
+						return Err(format!(
+							"{name}: bad data_offsets [{start}, {end}] in shard {shard_name}"
+						));
+					}
+					let offset = data_start + start; // ABSOLUTE within the file
+					eprintln!(
+						"[model]     {} dtype={} shape={:?} abs_offset={} len={}",
+						name, info.dtype, info.shape, offset, end - start
+					);
+					tensors.insert(
+						(*name).clone(),
+						TensorMeta {
+							name: (*name).clone(),
+							dtype: info.dtype.clone(),
+							shape: info.shape.clone(),
+							offset,
+							len: end - start,
+							shard: shard_name.clone(),
+						},
+					);
+				}
+			}
+		} else if single_path.exists() {
+			// ── single-shard model ────────────────────────────────────────────
+			let (header_len, data_start, header_tensors) = parse_safetensors_header(&single_path)?;
+			eprintln!(
+				"[model] single shard: header_len={} data_start={} tensors={}",
+				header_len, data_start, header_tensors.len()
+			);
+			shard_data_starts.insert("model.safetensors".into(), data_start);
+			for (name, info) in &header_tensors {
+				let (start, end) = info.data_offsets;
+				if end <= start {
+					return Err(format!("{name}: bad data_offsets [{start}, {end}]"));
+				}
+				let offset = data_start + start;
+				eprintln!(
+					"[model]     {} dtype={} shape={:?} abs_offset={} len={}",
+					name, info.dtype, info.shape, offset, end - start
+				);
+				tensors.insert(
+					name.clone(),
+					TensorMeta {
+						name: name.clone(),
+						dtype: info.dtype.clone(),
+						shape: info.shape.clone(),
+						offset,
+						len: end - start,
+						shard: "model.safetensors".into(),
+					},
+				);
+			}
+		} else {
+			return Err(format!(
+				"no model.safetensors.index.json or model.safetensors in {}",
+				model_dir.display()
+			));
+		}
+
+		if tensors.is_empty() {
+			return Err("model loaded zero tensors — refusing to continue".into());
+		}
+		eprintln!("[model] loaded {} tensors total", tensors.len());
+
+		Ok(Self {
+			dir: model_dir.to_path_buf(),
+			tensors,
+			shard_data_starts,
+		})
+	}
+
+	/// Look up one tensor by exact name.
+	pub fn tensor(&self, name: &str) -> Option<&TensorMeta> {
+		self.tensors.get(name)
+	}
+
+	/// All tensors whose name contains `needle`, in no particular order.
+	pub fn find(&self, needle: &str) -> Vec<&TensorMeta> {
+		self.tensors.values().filter(|t| t.name.contains(needle)).collect()
+	}
+
+	/// One of each dense projection kind (down_proj / q_proj / up_proj), preferring
+	/// the earliest layer. Returns whatever it found — an empty vec means the model
+	/// has no recognizable projections.
+	pub fn pick_projections(&self) -> Vec<&TensorMeta> {
+		let mut down: Option<&TensorMeta> = None;
+		let mut q: Option<&TensorMeta> = None;
+		let mut up: Option<&TensorMeta> = None;
+
+		for t in self.tensors.values() {
+			if !t.is_projection_weight() {
+				continue;
+			}
+			let lower = t.name.to_lowercase();
+			if down.is_none() && lower.contains(".mlp.down_proj.weight") {
+				down = Some(t);
+			} else if q.is_none() && lower.contains(".self_attn.q_proj.weight") {
+				q = Some(t);
+			} else if up.is_none() && lower.contains(".mlp.up_proj.weight") {
+				up = Some(t);
+			}
+			if down.is_some() && q.is_some() && up.is_some() {
+				break;
+			}
+		}
+
+		let mut out = Vec::new();
+		for t in [down, q, up].into_iter().flatten() {
+			out.push(t);
+		}
+		out
+	}
+}
+
+/// Parse one safetensors file's header. Returns (header_len, data_section_start,
+/// tensor_name → info) where data_section_start = 8 + header_len — the absolute
+/// file offset at which data_offsets[0] == 0 would begin.
+fn parse_safetensors_header(
+	path: &std::path::Path,
+) -> Result<(u64, u64, HashMap<String, SafeTensorInfo>), String> {
+	use std::io::{Read, Seek};
+
+	let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+	let mut len_bytes = [0u8; 8];
+	f.read_exact(&mut len_bytes).map_err(|e| format!("read length prefix: {e}"))?;
+	let header_len = u64::from_le_bytes(len_bytes);
+	if header_len == 0 || header_len > 1 << 30 {
+		return Err(format!("implausible header_len {header_len} in {}", path.display()));
+	}
+	let mut hdr = vec![0u8; header_len as usize];
+	f.read_exact(&mut hdr).map_err(|e| format!("read header: {e}"))?;
+
+	let json_str = std::str::from_utf8(&hdr).map_err(|e| format!("header not utf8: {e}"))?;
+	let parsed: SafeTensorsHeader = serde_json::from_str(json_str)
+		.map_err(|e| format!("shard header JSON in {}: {e}", path.display()))?;
+
+	let data_start = 8 + header_len;
+	let mut tensors = HashMap::new();
+	for (name, info) in parsed.tensors {
+		tensors.insert(name, info);
+	}
+	Ok((header_len, data_start, tensors))
+}
+
+// ---------------------------------------------------------------------------
 // GGUF
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]

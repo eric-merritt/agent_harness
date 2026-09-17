@@ -391,9 +391,7 @@ impl GpuContext {
 		unsafe {
 			let result = device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
 			match result {
-				Ok(_) => {
-					println!("Successfully recycled command buffer.");
-				},
+				Ok(_) => {},
 				Err(_) => {
 					eprintln!("Failed to recycle command buffer.");
 				}
@@ -407,18 +405,8 @@ impl GpuContext {
 	/// Deprecated — kept for callers that still need one-off uploads.
 	/// For batched page writes, use `batch_upload` instead.
 	pub unsafe fn upload(&self, buf: vk::Buffer, offset: vk::DeviceSize, data: &[u8]) {
-		use std::time::Instant;
-		let t = Instant::now();
 		let size = data.len() as vk::DeviceSize;
-		eprintln!(
-			"[UPLOAD] t=0ms  START — {} bytes to buf={:?} offset={}",
-			size, buf, offset
-		);
 		if size == 0 {
-			eprintln!(
-				"[UPLOAD] t+{:3}ms  size==0, returning early",
-				t.elapsed().as_millis()
-			);
 			return;
 		}
 
@@ -470,7 +458,7 @@ impl GpuContext {
 			.size(size)];
 
 		unsafe {
-			self.submit_copy_batch(staging, buf, &copies, t);
+			self.submit_copy_batch(staging, buf, &copies);
 		}
 
 		// 5. Cleanup staging buffer + allocation
@@ -479,11 +467,6 @@ impl GpuContext {
 		}
 		let mut guard = self.allocator.lock().unwrap();
 		let _ = guard.free(alloc);
-		eprintln!(
-			"[UPLOAD] t+{:3}ms  DONE — {} bytes",
-			t.elapsed().as_millis(),
-			data.len()
-		);
 	}
 
 	/// Batch multiple buffer copies into a single staging buffer + one submit.
@@ -494,9 +477,6 @@ impl GpuContext {
 		regions: &[(vk::DeviceSize, vk::DeviceSize, vk::DeviceSize)],
 		data: &[&[u8]],
 	) {
-		use std::time::Instant;
-		let t = Instant::now();
-
 		if regions.is_empty() || data.is_empty() {
 			return;
 		}
@@ -563,7 +543,7 @@ impl GpuContext {
 		}
 
 		unsafe {
-			self.submit_copy_batch(staging, buf, &copies, t);
+			self.submit_copy_batch(staging, buf, &copies);
 		}
 
 		// Cleanup
@@ -580,7 +560,6 @@ impl GpuContext {
 		staging: vk::Buffer,
 		dst_buf: vk::Buffer,
 		copies: &[vk::BufferCopy],
-		_t: std::time::Instant,
 	) {
 		// Queue idle ensures no other work is in-flight on this queue
 		unsafe {
@@ -630,7 +609,6 @@ impl GpuContext {
 			let result = self.device_handle.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());
 			match result {
 				Ok(_) => {
-					println!("Successfully recycled fence and command buffer. Pushing.");
 					self.cmd_buffer_pool.lock().unwrap().push(cmd);
 				},
 				Err(_) => {
@@ -648,22 +626,9 @@ impl GpuContext {
 		offset: vk::DeviceSize,
 		size: vk::DeviceSize,
 	) -> Vec<u8> {
-		use std::time::Instant;
-		let t = Instant::now();
-		eprintln!(
-			"[DOWNLOAD] t=0ms  START — {} bytes from buf={:?} offset={}",
-			size, buf, offset
-		);
 		if size == 0 {
-			eprintln!("[DOWNLOAD] size==0, returning empty vec");
 			return Vec::new();
 		}
-
-		// 1. Create staging buffer
-		eprintln!(
-			"[DOWNLOAD] t+{:3}ms  creating staging buffer...",
-			t.elapsed().as_millis()
-		);
 
 		// 1. Create staging buffer
 		let staging = unsafe {
@@ -722,10 +687,6 @@ impl GpuContext {
 		}
 
 		// 4. Submit and wait (reuse fence from pool)
-		eprintln!(
-			"[DOWNLOAD] t+{:3}ms  creating fence + submitting...",
-			t.elapsed().as_millis()
-		);
 		let fence = Self::alloc_fence(&self.device_handle, &self.fence_pool);
 		unsafe {
 			self.device_handle
@@ -735,17 +696,9 @@ impl GpuContext {
 					fence,
 				)
 				.expect("submit download");
-			eprintln!(
-				"t+{:3}ms  queue_submit done, waiting on fence (BLOCKS HERE = GPU HANG)...",
-				t.elapsed().as_millis()
-			);
 			self.device_handle
 				.wait_for_fences(&[fence], true, u64::MAX)
 				.expect("wait download fence");
-			eprintln!(
-				"[DOWNLOAD] t+{:3}ms  fence signaled, reading data...",
-				t.elapsed().as_millis()
-			);
 		}
 
 		// 5. Read data from mapped staging memory
@@ -1606,6 +1559,13 @@ pub unsafe fn initialize_controller_from_hardware(
     let total_pages = (total_addressable / page_size) as usize;
 
     // ── 5a. Create the sparse buffer arena first ──
+    // init_gpu() caps the reservation via AGENT_HARNESS_ARENA_BYTES (the raw
+    // cpu+vram figure is too big for any driver's max allocation).
+    let total_addressable = std::env::var("AGENT_HARNESS_ARENA_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(total_addressable);
+    eprintln!("[CONTROLLER] arena reservation: {} bytes", total_addressable);
     let arena = unsafe {
         VirtualTensorArena::new(&device, allocator.clone(), total_addressable, page_size)
     };

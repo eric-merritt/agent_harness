@@ -2,17 +2,30 @@
 //
 // Trellis bit quantizer — Vulkan 1.3 compute (no lookups, no CUDA, vendor-agnostic).
 //
-// One workgroup = one 32×32 weight tile = one tail-biting trellis ring of length 1024.
-// The tile is staged into shared memory at entry; the Viterbi DP then runs entirely in
-// registers + shared, fragmenting the ring into sequential 32-step sliding windows so the
-// backpointer history never exceeds one 8 KB window on-chip:
+// ── ONE WARP PER TILE ────────────────────────────────────────────────────────────
+// local_size_x = 32, local_size_y = 4 : one workgroup = 128 threads = 4 warps = 4 tiles.
+// Warp w (w = flat_lane / 32) owns tile w entirely: its own staged weights, its own
+// Viterbi cost row, its own backpointer arena slice. A warp does its whole DP + traceback
+// alone — no cross-warp shuffles for the DP at all. The only shared state a warp touches
+// is its own per-tile rows in shared memory and its own bytes in the sparse-buffer arena.
 //
-//     per window : forward cost pass (256 states) → backward traceback through bp[]
-//                  → bit-pack the K-bit stream → stream packed bytes to binding 1 NOW
+// Why one warp per tile: the trellis DP is inherently sequential down the ring (each step
+// reads the previous cost row), so it can't be split across warps without a barrier every
+// step — which is exactly what the old 4-warps-per-tile version did, and it stalled. A
+// single warp keeps its whole tile in registers + its own shared rows and marches down the
+// ring with no inter-warp sync. Four independent tiles per workgroup give the SM four
+// warps to hide each other's latency.
 //
-// State width is 8 bits → 256 states. Cost row = 256×u32 = 1 KB, backpointer window =
-// 32×256 u8 = 8 KB — both fit the Ada 99 KB/workgroup limit with room to spare. A 16-bit
-// (65,536-state) table would be 256 KB and is rejected by design.
+// Per-tile state (all in shared, indexed by warp id so the 4 tiles never collide):
+//     wt[1024]    : the staged 32×32 tile            4 KB/tile
+//     cost[256]   : current Viterbi cost row          —
+//     bcost[256]  : scratch next-row during a step    —
+//   = 6 KB/tile × 4 tiles = 24 KB/workgroup, well under the 48 KB/workgroup cap.
+//
+// The backpointer window (WIN×NSTATE = 8 KB/tile) is NOT in shared: it's written once per
+// step and read exactly once at traceback, so on-chip it's pure dead weight. It lives in
+// the sparse-buffer arena (binding 2), one slice per tile at
+//     gl_WorkGroupID.x * (4 * WIN*NSTATE) + warp_id * (WIN*NSTATE).
 //
 // ── ZERO LOOKUPS ────────────────────────────────────────────────────────────────
 // No codebook table, no transition LUT, ever. Every decoded symbol is computed from its
@@ -21,18 +34,19 @@
 // The DP transition output for state s is decode(low-K-bits(s)); the cost compare is a
 // plain integer `<` on fixed-point (shift-scaled) squared error.
 //
-// ── BINDINGS (mirror hessian_estimate.comp) ─────────────────────────────────────
-//   binding 0 : one flat f32 arena, three regions back-to-back:
-//               [0 .. n_act)                     = plaintext calibration activations x
-//               [n_act .. n_act + n_out)         = scratch (unused here, kept for layout)
-//               [n_act + n_out .. )              = per-tile K-bit rate map (one u32/tile)
-//   binding 1 : paged sparse weight region — the packed trellis output lands here, one
-//               (1024·K/8)-byte stream + one fp16 scale per tile, back-to-back.
+// ── BINDINGS (tile-ring pipeline, batch double-buffered by the host) ────────────
+//   binding 0 : INPUT RING — SLOTS TileSlots back-to-back, one per in-flight tile:
+//               [1024×f32 tile][u32 K][f32 scale][u32 flag]  (4108 B each)
+//               CPU writes data/K/scale then flag = seq; we read it when flag == seq.
+//   binding 1 : OUTPUT RING — SLOTS OutSlots back-to-back:
+//               [packed words][f32 scale][u32 done_flag]
+//               We write the packed stream + scale, then done_flag = seq (release).
+//   binding 2 : BACKPOINTER ARENA — one WIN×NSTATE byte block PER TILE (4 per workgroup),
+//               laid out contiguously. The host commits every page before dispatch; it's
+//               small enough to stay fully GPU-resident the whole run, so no streaming.
 //
-// ── WARP SHAPE / REGISTER FILE ──────────────────────────────────────────────────
-// local_size_x = 32, local_size_y = 4 : one Ada warp per row of the tile grid (128 lanes
-// = exactly the tile). Lane (x,y) owns tile element (x,y); the DP cost rows live in
-// shared and fold across the warp with subgroup shuffles.
+// The host dispatches `SLOTS/4` workgroups per batch (4 tiles each); workgroup g, warp w
+// handles global tile  g*4 + w. Batch N+1 is prepped by the CPU while this batch runs.
 
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -41,38 +55,51 @@
 
 layout(local_size_x = 32, local_size_y = 4) in;
 
-layout(std430, binding = 0) buffer Activations {
-    float data[];
-} abuf;
+// One input tile slot: the 32×32 f32 weights + rate + scale + handshake flag.
+struct TileSlot {
+    float data[1024];
+    uint k;
+    float scale;
+    uint flag;
+};
 
-// Packed trellis output stream (bytes). Addressed as u32 words.
-layout(std430, binding = 1) buffer WeightOut {
-    uint wdata[];
-} wbuf;
+// One output slot: packed bitstream words (max K=8 → 1024 words) + fp32 scale + done flag.
+struct OutSlot {
+    uint wdata[1024];
+    float scale;
+    uint done_flag;
+};
 
-layout(push_constant) uniform Push {
-    uint n_tiles;     // tiles in this layer's grid (grid.x extent == n_tiles)
-    uint seed;        // kept for layout parity with the sibling estimator
-} pc;
+layout(std430, binding = 0) buffer InRing {
+    TileSlot slots[];
+} inring;
 
-// Per-tile rate map: one u32 K per tile, uploaded by the host before dispatch. Each
-// workgroup reads its own K from gl_WorkGroupID.x — no per-tile push constant, so the
-// whole grid is ONE cmd_dispatch.
-layout(std430, binding = 2) buffer RateMap {
-    uint kmap[];
-} rbuf;
+layout(std430, binding = 1) buffer OutRing {
+    OutSlot oslots[];
+} outring;
+
+// Backpointer arena: WIN*NSTATE bytes per TILE (4 tiles per workgroup), indexed by the
+// global tile id. Lives in the sparse-buffer arena (binding 2), not shared memory.
+layout(std430, binding = 2) buffer BpArena {
+    int8_t bp[];
+} bparena;
 
 const uint TILE = 32u;
 const uint RING = TILE * TILE;   // 1024 elements per tile ring
 const uint NSTATE = 256u;        // 8-bit trellis states (QTIP/TCQ-class)
 const uint WIN = 32u;            // sliding window: 32 ring steps per on-chip traceback
+const uint TILES_PER_WG = 4u;    // one warp per tile, 4 warps in this workgroup
 
-// ── Shared memory (the whole DP lives here — nothing spills to global mid-pass). ──
-shared float wt[RING];                       // the tile, staged once at entry (4 KB)
-shared uint cost[NSTATE];                    // current Viterbi cost row (1 KB)
-shared uint bcost[NSTATE];                   // scratch next-row during a step (1 KB)
-shared int8_t bp[WIN][NSTATE];               // backpointer window: 32 steps × 256 (8 KB)
-shared float rms_warp[4];                    // per-warp partial sum for the rms reduce
+// ── Shared memory — one set of rows PER TILE (per warp), so the 4 tiles are isolated. ─
+// wt:      the staged tile, one row of RING floats per tile.
+shared float wt[TILES_PER_WG * RING];
+// cost / bcost: the Viterbi cost row + scratch, one NSTATE row per tile.
+shared uint  cost[TILES_PER_WG * NSTATE];
+shared uint  bcost[TILES_PER_WG * NSTATE];
+// win_words: this tile's packed bitstream, accumulated window-by-window so the final
+// coalesced write-out below can read it all at once. Worst case K=8 → RING words/tile.
+// That's 4 KB/tile × 4 = 16 KB — pushes total shared to 24+16 = 40 KB, still under 48.
+shared uint  win_words[TILES_PER_WG * RING];
 
 // ── mul1 lattice decode — pure arithmetic, no table. ───────────────────────────
 // i is the K low bits of a state; returns the fp16 codebook value as an f32.
@@ -91,20 +118,19 @@ uint fp_sq_err(float a, float b) {
     return (m * m) >> 4;   // /16 to stay well under u32 overflow for |d|<=~8
 }
 
-// One Viterbi step over the trellis graph. Each target state t has EXACTLY two legal
-// incoming predecessors — its parent with a 0-bit or 1-bit shifted in:
-//     pred(t, b) = ((t << 1) | b) & 0xFF      (b ∈ {0,1})
-// so the per-target min is over TWO candidates, not all 256 states. The symbol emitted on
-// the transition out of predecessor s is decode(low-K-bits(s)) — pure mul1 arithmetic, no
-// table. All 256 targets are covered by the 64 active lanes (two targets each); warps 2,3
-// sit out this step and rejoin at the barrier. `mask` is this tile's (1<<K)-1, read from
-// the per-tile rate map — K varies per tile, so it is NOT a push constant.
-void viterbi_step(float x, uint step_in_win, uint mask) {
-    uint lane = gl_LocalInvocationID.x + gl_LocalInvocationID.y * 32u;
-    if (lane >= 64u) return;   // 64 lanes × 2 targets = 256 states
-
+// One Viterbi step over the trellis graph, done by a SINGLE WARP for its own tile.
+// Each of the warp's 32 lanes covers two target states (lane l → targets 2l, 2l+1), so
+// all 256 states are covered with no idle lanes and no cross-warp traffic. The cost row
+// lives in this warp's shared slice; the backpointer row goes to the arena. `mask` is
+// this tile's (1<<K)-1, `x` the current ring element, `step_in_win` the step within the
+// window (for the arena offset), and `bp_base`/`c_base` point at this tile's slices.
+void viterbi_step(float x, uint step_in_win, uint mask, uint lane,
+                  uint bp_base, uint c_base) {
     uint t0 = lane * 2u;
     uint t1 = lane * 2u + 1u;
+
+    // Arena row for this step: WIN*NSTATE bytes per tile, offset by the tile's slice.
+    uint bp_off = bp_base + step_in_win * NSTATE;
 
     // Target t0: min over its two legal predecessors.
     {
@@ -112,10 +138,10 @@ void viterbi_step(float x, uint step_in_win, uint mask) {
         uint p1 = ((t0 << 1u) | 1u) & 0xFFu;
         float s0 = mul1_decode(p0 & mask);
         float s1 = mul1_decode(p1 & mask);
-        uint c0 = cost[p0] + fp_sq_err(x, s0);
-        uint c1 = cost[p1] + fp_sq_err(x, s1);
+        uint c0 = cost[c_base + p0] + fp_sq_err(x, s0);
+        uint c1 = cost[c_base + p1] + fp_sq_err(x, s1);
         if (c1 < c0) { c0 = c1; p0 = p1; }
-        bcost[t0] = c0; bp[step_in_win][t0] = int8_t(p0);
+        bcost[c_base + t0] = c0; bparena.bp[bp_off + t0] = int8_t(p0);
     }
     // Target t1: same, two legal predecessors.
     {
@@ -123,136 +149,188 @@ void viterbi_step(float x, uint step_in_win, uint mask) {
         uint p1 = ((t1 << 1u) | 1u) & 0xFFu;
         float s0 = mul1_decode(p0 & mask);
         float s1 = mul1_decode(p1 & mask);
-        uint c0 = cost[p0] + fp_sq_err(x, s0);
-        uint c1 = cost[p1] + fp_sq_err(x, s1);
+        uint c0 = cost[c_base + p0] + fp_sq_err(x, s0);
+        uint c1 = cost[c_base + p1] + fp_sq_err(x, s1);
         if (c1 < c0) { c0 = c1; p0 = p1; }
-        bcost[t1] = c0; bp[step_in_win][t1] = int8_t(p0);
+        bcost[c_base + t1] = c0; bparena.bp[bp_off + t1] = int8_t(p0);   // winner is in p0 after the swap above
     }
 }
 
 void main() {
-    uint tile_idx = gl_WorkGroupID.x;
-    if (tile_idx >= pc.n_tiles) return;
+    // This warp's identity within the workgroup: warp w owns tile w.
+    uint warp_id = gl_LocalInvocationIndex / 32u;   // 0..3 (4 warps)
+    uint lane    = gl_LocalInvocationIndex % 32u;   // 0..31
 
-    // This tile's rate, read once from the per-tile map (uniform across the workgroup).
-    uint K = rbuf.kmap[tile_idx];
+    // Global tile id: workgroup g holds tiles [g*4, g*4+3]; this warp takes tile w.
+    uint tile_id = gl_WorkGroupID.x * TILES_PER_WG + warp_id;
+
+    TileSlot s = inring.slots[tile_id];
+
+    uint K = s.k;
     uint mask = (K > 0u) ? ((1u << K) - 1u) : 0u;
 
-    // ── Stage the 32×32 tile into shared once (cooperative, coalesced). ──────────
-    uint n_in = TILE * TILE;                  // tile is always 32×32 by construction
-    // The plaintext calibration activations for this tile are pre-staged by the host in
-    // binding 0's scratch half at [tile_idx*RING .. +RING) — we OVERWRITE binding 1 with
-    // packed output, so the input must come from the activation arena.
-    uint src_base = n_in;   // scratch base in elements (see header layout)
-    for (uint i = gl_LocalInvocationIndex; i < RING; i += 128u) {
-        wt[i] = abuf.data[src_base + tile_idx * RING + i];
-    }
-    barrier();
+    // This tile's slice offsets into the shared rows and the arena.
+    uint wt_base  = warp_id * RING;
+    uint c_base   = warp_id * NSTATE;
+    uint bp_base  = tile_id * (WIN * NSTATE);
 
-    // ── Per-tile scale: rms(tile). Full workgroup reduce (4 warps → shared). ──────
+    // DEBUG: phase progress marker (host reads this to see where we're stuck).
+    if (lane == 0u) { outring.oslots[tile_id].wdata[1] = 1u; }
+
+    // ── Stage this tile's 32×32 weights into its shared row (coalesced, warp-only). ──
+    for (uint i = lane; i < RING; i += 32u) {
+        wt[wt_base + i] = s.data[i];
+    }
+    // Synchronize only THIS warp — the other 3 warps are working on their own tiles and
+    // must not be stalled by this one. (A full barrier() here would serialize all 4.)
+    subgroupBarrier();
+
+    if (lane == 0u) { outring.oslots[tile_id].wdata[1] = 2u; }
+
+    // ── Per-tile scale: rms(tile), reduced across this warp only. ────────────────
     float acc = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < RING; i += 128u) { acc += wt[i] * wt[i]; }
-    // Intra-warp fold first (cheap shuffle), then one shared slot per warp, barrier, sum.
+    for (uint i = lane; i < RING; i += 32u) { acc += wt[wt_base + i] * wt[wt_base + i]; }
+    // Intra-warp fold via shuffle (no reduce builtin in the basic subgroup ext).
     float r = acc;
     for (uint m = 16u; m > 0u; m >>= 1) { r += subgroupShuffleXor(r, m); }
-    if (gl_LocalInvocationID.x == 0u) { rms_warp[gl_LocalInvocationID.y] = r; }
-    barrier();
-    float rms = sqrt((rms_warp[0] + rms_warp[1] + rms_warp[2] + rms_warp[3]) / float(RING));
+    float rms = sqrt(r / float(RING));
 
-    // ── Sliding-window Viterbi over the 1024-ring, 32 steps per window. ─────────
-    // cost[] starts uniform (state 0 preferred via tiny bias so the ring has a seed).
-    for (uint s = gl_LocalInvocationIndex; s < NSTATE; s += 128u) {
-        cost[s] = (s == 0u) ? 0u : 1u;   // seed: state 0 starts free, others pay 1
+    if (lane == 0u) { outring.oslots[tile_id].wdata[1] = 3u; }
+
+    // ── Seed the cost row: state 0 free, others pay 1 (gives the ring a start). ────
+    if (lane == 0u) {
+        for (uint s_ = 0u; s_ < NSTATE; ++s_) {
+            cost[c_base + s_] = (s_ == 0u) ? 0u : 1u;
+        }
     }
-    barrier();
+    subgroupBarrier();
 
-    // Packed stream for THIS tile starts at word `out_word_base` in binding 1. Each tile's
-    // stream is (RING*K bits → words) + 1 trailing fp16-scale word, laid out back-to-back.
-    uint stream_words = (RING * K + 7u) / 8u / 4u;   // whole words in the bitstream
-    uint out_word_base = tile_idx * (stream_words + 1u);  // +1 for the scale word slot
+    if (lane == 0u) { outring.oslots[tile_id].wdata[1] = 4u; }
 
+    // DEBUG: write a marker before the outer loop to see if we reach it
+    if (gl_LocalInvocationIndex == 0u) { outring.oslots[0].wdata[2] = 0xDEAD; }
+
+    // ── Sliding-window Viterbi over the 1024-ring, 32 steps per window. ───────────
     for (uint w = 0u; w < RING / WIN; ++w) {
-        // ── Forward pass over this window's 32 steps, recording bp[]. ────────────
+        // Forward pass over this window's 32 steps, recording bp[] to the arena.
         for (uint st = 0u; st < WIN; ++st) {
             uint pos = w * WIN + st;              // ring position
-            float x = wt[pos];
-            viterbi_step(x, st, mask);
-            barrier();                            // all lanes done writing bcost[]/bp[st]
+            float x = wt[wt_base + pos];
 
-            // Swap cost <-> bcost. Barrier BEFORE so no lane reads cost[] while another
-            // is still mid-swap; barrier AFTER so the swap is globally visible before the
-            // next viterbi_step reads cost[].
+            // Execute the Viterbi step for this tile's row
+            viterbi_step(x, st, mask, lane, bp_base, c_base);
+
+            // Critical: Force all 4 warps to complete writes to bcost[] and bp arena
+            // before any single thread attempts to execute the swap phase.
             barrier();
-            for (uint s = gl_LocalInvocationIndex; s < NSTATE; s += 128u) {
-                uint tmp = cost[s]; cost[s] = bcost[s]; bcost[s] = tmp;
-            }
+
+            // Parallel Swap: All 128 threads cooperate to execute the row swap uniformly.
+            // With 128 threads active across the workgroup, each individual thread handles
+            // exactly 2 elements to cover the 256 trellis states (128 * 2 = 256).
+            uint idx0 = gl_LocalInvocationIndex;
+            uint idx1 = gl_LocalInvocationIndex + 128u;
+
+            uint tmp0 = cost[c_base + idx0];
+            cost[c_base + idx0] = bcost[c_base + idx0];
+            bcost[c_base + idx0] = tmp0;
+
+            uint tmp1 = cost[c_base + idx1];
+            cost[c_base + idx1] = bcost[c_base + idx1];
+            bcost[c_base + idx1] = tmp1;
+
+            // Sync the entire workgroup again so that the swapped cost values are
+            // globally visible before any warp initiates the next loop step.
             barrier();
         }
-         // ── Traceback and dump directly to scratch pad ───────────────────────────
-        if (gl_LocalInvocationID.y == 0u) {
-            uint lane = gl_LocalInvocationID.x; // 0..31
 
-            // 1. Parallel 256-State Min-Cost State Reduction
-            uint min_c = cost[lane];
+        // ── Traceback: reconstruct this window's 32 states, pack into words. ──────
+        // The whole warp does it (lane l = step l). Backpointers are in the arena (we
+        // just wrote them → L2 hit), read back here.
+        {
+            // 1. Parallel 256-state min-cost reduction across the warp.
+            uint min_c = cost[c_base + lane];
             uint min_idx = lane;
             for (uint stride = 32u; stride < NSTATE; stride += 32u) {
-                uint c = cost[lane + stride];
+                uint c = cost[c_base + lane + stride];
                 if (c < min_c) { min_c = c; min_idx = lane + stride; }
             }
-
             for (uint offset = 16u; offset > 0u; offset >>= 1) {
                 uint remote_c = subgroupShuffleXor(min_c, offset);
                 uint remote_idx = subgroupShuffleXor(min_idx, offset);
                 if (remote_c < min_c) { min_c = remote_c; min_idx = remote_idx; }
             }
-            uint cur_state = subgroupShuffle(min_idx, 0u);
+            uint end_state = subgroupShuffle(min_idx, 0u);
 
-            // 2. Parallel Traceback: Reconstruct the path backwards
-            uint my_step_state = 0u;
+            // 2. Walk back WIN-1 steps; lane l captures the state at step l. The path
+            //    pointer must stay UNIFORM across the warp: read the backpointer for the
+            //    single state the whole warp is tracking, then broadcast it so all 32
+            //    lanes walk the same global path backward in lockstep.
+            uint my_symbol = 0u;
             for (int step = int(WIN) - 1; step >= 0; --step) {
-                if (int(lane) == step) {
-                    my_step_state = cur_state;
+                if (lane == uint(step)) {
+                    my_symbol = end_state & mask;
                 }
-                cur_state = uint(bp[step][cur_state]);
+                uint next_state = uint(bparena.bp[bp_base + step * NSTATE + end_state]) & 0xFFu;
+                end_state = subgroupShuffle(next_state, 31u);
             }
 
-            // 3. Dump the un-packed K-bit symbol directly into the scratch pad
-            uint ring_pos = w * WIN + lane;
-            // Scratch offset starts exactly at n_act (which is src_base by design)
-            uint scratch_idx = src_base + tile_idx * RING + ring_pos;
-            abuf.data[scratch_idx] = float(my_step_state & mask);
-        }
-        barrier(); // Wait for scratch write to finish before moving to the next window
-    }
+            // 3. Pack: symbol l's K bits go to global bit position (l*K .. l*K+K-1). A
+            //    window holds 32 symbols = up to 256 bits at K=8 → several words. Reduce
+            //    PER OUTPUT WORD (a blind whole-warp OR would crush word-boundary symbols
+            //    into one register). For each word j, mask out only the bits that land in
+            //    it and let lane j commit. In-register throughout — no shared RMW.
+            uint n_win_words = (WIN * K + 31u) / 32u;   // ≤ 4 at K≤8
 
-    // ── Coalesced Bit-Packing Pass via Scratch Pad ───────────────────────────────
-    // The entire 1024-ring is now unwrapped in scratch. We use the full 128-lane workgroup 
-    // to read, pack, and stream out the words sequentially.
-    uint total_words = stream_words;
-    for (uint w_idx = gl_LocalInvocationIndex; w_idx < total_words; w_idx += 128u) {
-        uint bit_start = w_idx * 32u;
-        uint local_packed = 0u;
+            uint my_bits = 0u;
+            for (uint b = 0u; b < K; ++b) {
+                if (((my_symbol >> b) & 1u) != 0u) {
+                    uint bit_pos = lane * K + b;
+                    my_bits |= (1u << (bit_pos & 31u));
+                }
+            }
 
-        // Pack 32 bits sequentially into this word
-        for (uint b = 0u; b < 32u; ++b) {
-            uint global_bit = bit_start + b;
-            uint symbol_idx = global_bit / K;
-            uint bit_offset = global_bit % K;
+            // Commit this window's words into the tile's packed row; the final write-out
+            // reads them all back once every window is done.
+            [[unroll]]
+            for (uint j = 0u; j < 8u; ++j) {
+                if (j >= n_win_words) break;
 
-            if (symbol_idx < RING) {
-                uint scratch_idx = src_base + tile_idx * RING + symbol_idx;
-                uint symbol = uint(abuf.data[scratch_idx]);
-                uint bit = (symbol >> bit_offset) & 1u;
-                local_packed |= (bit << b);
+                uint symbol_start_word = (lane * K) >> 5u;
+                uint symbol_end_word   = ((lane * K) + K - 1u) >> 5u;
+
+                uint word_contribution = 0u;
+                if (symbol_start_word == j || symbol_end_word == j) {
+                    uint bit_mask = 0xFFFFFFFFu;
+                    if (symbol_start_word != j) bit_mask = ~((1u << ((lane * K) & 31u)) - 1u);
+                    if (symbol_end_word != j)   bit_mask = (1u << (((lane * K) + K) & 31u)) - 1u;
+
+                    word_contribution = my_bits & bit_mask;
+                }
+
+                for (uint offset = 16u; offset > 0u; offset >>= 1) {
+                    word_contribution |= subgroupShuffleXor(word_contribution, offset);
+                }
+
+                if (lane == j) {
+                    // Global packed-word index for this window's word j.
+                    uint gw = w * n_win_words + j;
+                    win_words[warp_id * ((RING / WIN) * 4u) + gw] = word_contribution;
+                }
             }
         }
-        // Perfect coalesced global write
-        wbuf.wdata[out_word_base + w_idx] = local_packed;
+        subgroupBarrier();
     }
 
-    // ── Trailing fp16 scale ──────────────────────────────────────────────────────
-    if (gl_LocalInvocationIndex == 0u) {
-        uint scale_bits = packHalf2x16(vec2(rms, 0.0));
-        wbuf.wdata[out_word_base + stream_words] = scale_bits;
+    if (lane == 0u) { outring.oslots[tile_id].wdata[1] = 5u; }
+
+    // ── Coalesced write-out of this tile's packed stream to its output slot. ───────
+    uint total_packed_words = (RING * K + 31u) / 32u;   // ≤ 1024 at K≤8
+    for (uint i = lane; i < total_packed_words; i += 32u) {
+        outring.oslots[tile_id].wdata[i] = win_words[warp_id * ((RING / WIN) * 4u) + i];
+    }
+    if (lane == 0u) {
+        outring.oslots[tile_id].scale = rms;
+        memoryBarrierBuffer();
+        outring.oslots[tile_id].done_flag = s.flag + 1u;   // handshake: CPU set flag=seq, we answer seq+1
     }
 }
