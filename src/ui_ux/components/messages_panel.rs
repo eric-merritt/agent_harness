@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect, Size};
 use ratatui::style::{Color, Style, Modifier};
@@ -81,7 +82,6 @@ impl MessagesPanel {
 	/// Clicking the track above/below the thumb scrolls one page.
 	/// Clicking and dragging the thumb scrolls proportionally.
 	pub fn handle_mouse(&mut self, me: &crossterm::event::MouseEvent, area: Rect) -> bool {
-		use crossterm::event::MouseEventKind;
 
 		// Only act on events inside this panel's area
 		let in_area = me.row >= area.y
@@ -187,7 +187,6 @@ impl MessagesPanel {
 
 	/// Handle a key event for scrolling. Returns true if the key was consumed.
 	pub fn handle_key(&self, key: &crossterm::event::KeyEvent) -> bool {
-		use crossterm::event::KeyCode;
 		match key.code {
 			KeyCode::Up | KeyCode::Char('k') => {
 				let mut state = self.scroll_state.write().unwrap_or_else(|p| p.into_inner());

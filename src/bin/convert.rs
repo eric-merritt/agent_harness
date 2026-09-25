@@ -145,7 +145,6 @@ fn print_usage() {
 
 /// Report what actually landed on disk by reading the sandbag file back.
 fn print_summary(dst: &Path) {
-	use agent_harness::models::format::SandbagReader;
 
 	let reader = match SandbagReader::from_path(dst) {
 		Ok(r) => r,

@@ -14,6 +14,7 @@
 //! [`LayerGeometry`] and is unit-tested headless; the Vulkan allocation wraps it.
 
 use ash::vk;
+use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 use std::sync::{Arc, Mutex};
 
 /// Layer geometry: a baseline hidden dimension plus the sequence length, from which
@@ -176,7 +177,6 @@ pub unsafe fn alloc_ping_pong(
 	allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
 	geometry: &LayerGeometry,
 ) -> Result<PingPongActivation, String> {
-	use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 
 	let size = geometry.activation_bytes() as vk::DeviceSize;
 
@@ -234,8 +234,6 @@ pub unsafe fn alloc_ping_pong(
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use ash::vk::Handle;
 
 	/// The exact numbers from the spec — a regression guard for the sizing formulas.
 	#[test]

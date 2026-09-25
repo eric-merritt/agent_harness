@@ -1621,7 +1621,6 @@ pub unsafe fn initialize_controller_from_hardware(
 		src: &[u8],
 		blocks: &[BlockDescriptor],
 	) -> Result<u64, String> {
-		use rayon::prelude::*;
 
 		let page_size = self.arena.page_size as usize;
 		let total_pages = self.arena.total_pages;
@@ -1815,7 +1814,6 @@ pub static GLOBAL_CONTROLLER: OnceLock<Arc<Mutex<MemoryController>>> = OnceLock:
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 
 	/// Flatten a page plan back into the arena's byte image.
 	fn arena_image(tasks: &[(usize, Vec<u8>)], page_size: usize) -> Vec<u8> {

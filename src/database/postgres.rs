@@ -1,5 +1,6 @@
 // PostgreSQL connection and query helpers for conversations & messages.
 
+use sha2::{Digest, Sha256};
 use sqlx::{Error as SqlxError, PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -155,7 +156,6 @@ impl Database {
 		has_cf_challenge: bool,
 		media_links: serde_json::Value,
 	) -> Result<String, SqlxError> {
-		use sha2::{Digest, Sha256};
 
 		// Generate a deterministic-ish short ref from URL + timestamp
 		let now = chrono::Utc::now();
@@ -243,7 +243,6 @@ impl Database {
 		&self,
 		payload: &serde_json::Value,
 	) -> Result<String, SqlxError> {
-		use sha2::{Digest, Sha256};
 
 		let now = chrono::Utc::now();
 		let entropy = format!("{}-{}", payload, now.timestamp_nanos_opt().unwrap_or(0));

@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -313,7 +314,6 @@ impl Tool for WriteTool {
 			Err(e) => return ToolResult::err(format!("{}: {}", e.kind(), e)),
 		};
 
-		use std::io::Write;
 		if let Err(e) = file.write_all(content.as_bytes()) {
 			log::warn!("write_file: write error for {}: {}", path.display(), e);
 			return ToolResult::err(format!("Write error: {}", e));

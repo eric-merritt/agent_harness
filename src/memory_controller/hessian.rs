@@ -10,6 +10,7 @@
 //! bit-rate map. That function is deliberately a stub: it's the review checkpoint where
 //! we confirm the pipeline end-to-end before implementing the full trellis DP.
 
+use super::controller::GpuContext;
 use super::pingpong::{DualBindingLayout, LayerGeometry};
 use ash::vk;
 
@@ -202,7 +203,6 @@ pub unsafe fn dispatch_hessian(
 	layer_idx: u32,
 	seed: u32,
 ) -> Result<Vec<f32>, String> {
-	use super::controller::GpuContext;
 
 	let device = &ctx.device_handle;
 	let queue = ctx.queue_handle;
@@ -396,7 +396,6 @@ pub unsafe fn dispatch_trellis_encode(
 	weight_region: vk::Buffer,
 	rate_map_buf: vk::Buffer,
 ) -> Result<u64, String> {
-	use super::controller::GpuContext;
 
 	let device = &ctx.device_handle;
 	let queue = ctx.queue_handle;
@@ -897,7 +896,6 @@ pub unsafe fn dispatch_measure(
 	layer_idx: u32,
 	seed: u32,
 ) -> Result<Vec<f32>, String> {
-	use super::controller::GpuContext;
 
 	let device = &ctx.device_handle;
 	let queue = ctx.queue_handle;
@@ -968,7 +966,6 @@ pub unsafe fn dispatch_measure(
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 
 	/// The assignment must never exceed max_bits or drop below min_bits, and an all-equal
 	/// variance plane should produce a uniform width at the clamped budget.

@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -59,7 +59,6 @@ impl InputState {
 
 	/// Process a key event and return true if the key was consumed.
 	pub fn handle_key(&mut self, event: &KeyEvent) -> bool {
-		use crossterm::event::KeyCode;
 		if !self.is_focused {
 			return false;
 		}

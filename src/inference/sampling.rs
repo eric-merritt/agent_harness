@@ -1,5 +1,8 @@
 // Logit sampling: argmax, temperature, top-k.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// Greedy: pick the highest logit.
 pub fn argmax(logits: &[f32]) -> u32 {
 	let mut best = 0u32;
@@ -68,8 +71,6 @@ pub fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
 
 /// Simple PRNG (xorshift) initialized dynamically with system clocks to guarantee non-determinism.
 fn rand_val() -> f32 {
-	use std::sync::atomic::{AtomicU64, Ordering};
-	use std::time::{SystemTime, UNIX_EPOCH};
 
 	// Lazy initialize the atomic seed state using a non-deterministic Unix timestamp baseline
 	static SEED: AtomicU64 = AtomicU64::new(0);

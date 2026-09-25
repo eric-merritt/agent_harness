@@ -29,6 +29,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Seek};
+
+use GgmlType::*;
 
 // ---------------------------------------------------------------------------
 // ggml_type — mirrors ggml.h enum exactly (from llama.cpp)
@@ -280,7 +283,6 @@ impl TensorMeta {
 	pub fn read_bytes(&self, model_dir: &std::path::Path) -> Result<Vec<u8>, String> {
 		let path = model_dir.join(&self.shard);
 		let mut f = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-		use std::io::{Read, Seek};
 		f.seek(std::io::SeekFrom::Start(self.offset))
 			.map_err(|e| format!("seek {} @{}: {e}", self.name, self.offset))?;
 		let mut buf = vec![0u8; self.len as usize];
@@ -498,7 +500,6 @@ impl Model {
 fn parse_safetensors_header(
 	path: &std::path::Path,
 ) -> Result<(u64, u64, HashMap<String, SafeTensorInfo>), String> {
-	use std::io::{Read, Seek};
 
 	let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
 	let mut len_bytes = [0u8; 8];
@@ -635,7 +636,6 @@ impl GgufDtype {
 impl GgmlType {
 	/// Decode a GGML type id as written in a GGUF tensor-info record.
 	pub fn from_u32(v: u32) -> Option<Self> {
-		use GgmlType::*;
 		Some(match v {
 			0 => F32,
 			1 => F16,
@@ -679,7 +679,6 @@ impl GgmlType {
 
 	/// Elements per stored block. 1 for unquantized types.
 	pub fn block_size(self) -> u64 {
-		use GgmlType::*;
 		match self {
 			F32 | F16 | BF16 | F64 | I8 | I16 | I32 | I64 => 1,
 			Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q8_1 | IQ4_NL | MXFP4 | NVFP4 => 32,
@@ -691,7 +690,6 @@ impl GgmlType {
 
 	/// Bytes per stored block.
 	pub fn type_size(self) -> u64 {
-		use GgmlType::*;
 		match self {
 			F32 | I32 => 4,
 			F16 | BF16 | I16 => 2,
@@ -845,8 +843,8 @@ pub fn parse_gguf(data: &[u8]) -> Result<GgufHeader, String> {
 
 	// Tensor data is aligned; the alignment is itself a metadata key.
 	let alignment = match kv_meta.get("general.alignment") {
-		Some(GgufValue::Uint32(v)) => *v as u64,
-		Some(GgufValue::Uint64(v)) => *v,
+		Some(GgufValue::Uint32(v)) => v.clone() as u64,
+		Some(GgufValue::Uint64(v)) => v.clone(),
 		_ => 32,
 	};
 

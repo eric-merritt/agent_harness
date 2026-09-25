@@ -108,8 +108,8 @@ impl Tokenizer {
 			gguf.kv_meta
 				.get(key)
 				.and_then(|v| match v {
-					GgufValue::Uint32(v) => Some(*v),
-					GgufValue::Uint64(v) => Some(*v as u32),
+					GgufValue::Uint32(v) => Some(v.clone()),
+					GgufValue::Uint64(v) => Some(v.clone() as u32),
 					_ => None,
 				})
 				.unwrap_or(0)
@@ -587,7 +587,6 @@ impl Tokenizer {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 
 	#[test]
 	fn test_byte_mapping_space() {

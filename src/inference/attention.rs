@@ -268,9 +268,6 @@ impl<'a> AttnBlock<'a> {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use crate::inference::KvCache;
-	use crate::inference::config::ModelConfig;
 
 	fn test_config() -> ModelConfig {
 		ModelConfig {

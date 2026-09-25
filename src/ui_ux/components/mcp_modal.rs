@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Style};
@@ -439,7 +440,6 @@ impl McpModal {
 	}
 
 	pub fn handle_key(&mut self, ke: &crossterm::event::KeyEvent) -> ModalAction {
-		use crossterm::event::KeyCode;
 		let state = self.config_state.read().unwrap_or_else(|p| p.into_inner());
 		let is_busy = matches!(*state, ConfigState::Connecting);
 		drop(state);
@@ -520,7 +520,6 @@ impl McpModal {
 	}
 
 	pub fn handle_mouse(&self, me: &crossterm::event::MouseEvent) -> Option<ModalAction> {
-		use crossterm::event::MouseEventKind;
 		if let MouseEventKind::Down(_) = me.kind {
 			let col = me.column;
 			let row = me.row;

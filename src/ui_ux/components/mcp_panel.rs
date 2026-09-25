@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crossterm::event::MouseEventKind;
 use ratatui::Frame;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
@@ -116,7 +117,6 @@ impl McpPanel {
 	/// Returns Some(card_index) if a card was clicked, or None.
 	/// If the "+" button was clicked, returns None (check handle_mouse for that).
 	pub fn handle_card_click(&self, me: &crossterm::event::MouseEvent) -> Option<usize> {
-		use crossterm::event::MouseEventKind;
 		if let MouseEventKind::Down(_) = me.kind {
 			for (i, rect) in self.card_rects.iter().enumerate() {
 				if me.column >= rect.x
@@ -154,7 +154,6 @@ impl McpPanel {
 
 	/// Handle group row click. Returns true if a group was clicked.
 	pub fn handle_group_click(&self, me: &crossterm::event::MouseEvent) -> Option<String> {
-		use crossterm::event::MouseEventKind;
 		if let MouseEventKind::Down(_) = me.kind {
 			for (name, rect) in self.group_rects.borrow().iter() {
 				if me.column >= rect.x
@@ -183,7 +182,6 @@ impl McpPanel {
 
 	/// Returns true if the "+" button was clicked. Also tracks pressed state for color swap.
 	pub fn handle_mouse(&mut self, me: &crossterm::event::MouseEvent) -> bool {
-		use crossterm::event::MouseEventKind;
 		let on_button = |me: &crossterm::event::MouseEvent| -> bool {
 			if let Some(rect) = self.add_button_rect {
 				return me.column >= rect.x

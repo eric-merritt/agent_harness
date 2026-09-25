@@ -5,9 +5,15 @@
 //! lands at its original position in the output file. No decompression
 //! pipeline. No rearranging.
 
+use crate::memory_controller::controller::{GLOBAL_CONTROLLER, QuantizePushConstants};
 use crate::models::format::*;
 use crate::models::tensor::*;
+use ash::vk;
+use rayon::prelude::*;
 use std::io::Write;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 // ---------------------------------------------------------------------------
 // CPU: AVX512 quantize
@@ -99,7 +105,6 @@ pub fn quantize_cpu_with(
 	// Data section — quantize tensors in parallel, then concatenate in the
 	// original order. Order is the format's load-bearing invariant, so the
 	// parallelism is in the encoding only, never in the placement.
-	use rayon::prelude::*;
 	let encoded: Vec<Result<Vec<u8>, String>> = tensors
 		.par_iter()
 		.map(|t| {
@@ -451,7 +456,6 @@ fn avx512_quantize_block(block: &[u8], elem_count: usize, scheme: &GgmlType) -> 
 
 	#[cfg(target_arch = "x86_64")]
 	{
-		use std::arch::x86_64::*;
 
 		while i + 8 <= elem_count {
 			let ptr = unsafe { block.as_ptr().add(i * bytes_per_elem) };
@@ -604,7 +608,6 @@ pub fn quantize_gpu(
 	raw: &[u8],
 	dst_path: &std::path::Path,
 ) -> Result<(), String> {
-	use crate::memory_controller::controller::GLOBAL_CONTROLLER;
 
 	let ctrl = GLOBAL_CONTROLLER
 		.get()
@@ -680,8 +683,6 @@ fn dispatch_quantize_shader(
 	dst_bytes: u64,
 	dst_path: &std::path::Path,
 ) -> Result<(), String> {
-	use crate::memory_controller::controller::QuantizePushConstants;
-	use ash::vk;
 
 	/// Must match `GROUP` and `local_size_x` in sandbag_quantize.comp.
 	const ELEMS_PER_INVOCATION: u64 = 64;
@@ -879,7 +880,6 @@ fn dispatch_quantize_shader(
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 
 	/// The worked example from the format spec.
 	#[test]
